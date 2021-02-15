@@ -27,10 +27,6 @@ import (
 	"../labrpc"
 )
 
-// TODO: We're only making decisions once all rpcs return including timeouts.
-// But we can make decisions as soon as we have a majority to save time.
-// If testcases time out, then maybe make that optimization.
-
 // It doesn't look like they have this in stdlib.
 // go is trash.
 func max(a int, b int) int {

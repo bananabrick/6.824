@@ -36,6 +36,13 @@ func max(a int, b int) int {
 	return b
 }
 
+func min(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -68,8 +75,8 @@ const (
 )
 
 type raftLog struct {
-	appendTerm int         // term when log was initially appended to some server.
-	command    interface{} // The command which was sent by the client.
+	AppendTerm int         // term when log was initially appended to some server.
+	Command    interface{} // The command which was sent by the client.
 }
 
 // Raft is a single Raft peer.
@@ -201,21 +208,53 @@ type RequestVoteReply struct {
 	VoteGranted bool // Whether the peer voted for the candidate.
 }
 
-// AppendEntriesArgs is sent to the peer in the
-// [AppendEntries] RPC to.
+// Note that I'm separating heartbeats with appendEntries.
+// I'm not sure why I must not accept a heartbeat from a leader
+// if the entries don't match. The leader could take a while to
+// make entries match and I don't want to time out.
+
+// AppendEntriesArgs is used by the AppendEntries RPC to
+// tell a follower to update its log.
+type AppendEntriesArgs struct {
+}
+
+// AppendEntriesReply is used by the AppendEntries RPC to
+// signal to the leader if the append was a success.
+type AppendEntriesReply struct {
+}
+
+// HeartBeatArgs is sent to the peer in the
+// [HeartBeat] RPC to.
 // Note that only the leader should send these out.
 // However, there are cases when previous leaders could
 // potentially send these out. In that case, we reject
 // the leader.
-type AppendEntriesArgs struct {
+type HeartBeatArgs struct {
 	LeaderTerm int
 	LeaderID   int
+
+	// We need these property to maintain the invariant
+	// that if two log entries have the same term and same index, then
+	// they and all the preceding logs are the same.
+	// index of log entry preceding the new ones.
+	LeaderPrevLogIndex int
+	LeaderPrevLogTerm  int
+
+	// Logs to be applied on the server we're sending this to.
+	LeaderEntries [](*raftLog)
+
+	// Lets the receiving server know what it can commit.
+	LeaderCommitIndex int
 }
 
-// AppendEntriesReply returns some data
-// from the peer we sent an [AppendEntries] RPC to.
-type AppendEntriesReply struct {
+// HeartBeatReply returns some data
+// from the peer we sent an [HeartBeat] RPC to.
+type HeartBeatReply struct {
 	PeerTerm int
+
+	// Basically, return this to the leader, if we successfully
+	// appended the logs it sent us.
+	Success bool
 }
 
 // Checks periodically if timer has expired.
@@ -242,7 +281,7 @@ func (rf *Raft) lastLogTerm() int {
 	if len(rf.logs) == 0 {
 		return -1
 	}
-	return rf.logs[len(rf.logs)-1].appendTerm
+	return rf.logs[len(rf.logs)-1].AppendTerm
 }
 
 // Note that election is only allowed to commit its results
@@ -301,7 +340,7 @@ func (rf *Raft) startElection() {
 				rf.state = follower
 				rf.votedFor = -1
 				justReturn = true
-			} else if replies[replyFrom].VoteGranted == true {
+			} else if replies[replyFrom].VoteGranted {
 				numVotes++
 			}
 
@@ -321,9 +360,17 @@ func (rf *Raft) startElection() {
 	}
 }
 
-// Not sure if the same func will be used to send
-// log append entires too. Right now, just using
-// this to send heartbeat.
+func (rf *Raft) startAgreement() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state != leader {
+		// No business doing this if we're not the leader.
+		return
+	}
+
+	// TODO: Figure this out later.
+}
+
 func (rf *Raft) sendAppendEntries() {
 	for {
 		if rf.killed() {
@@ -344,14 +391,14 @@ func (rf *Raft) sendHearts() {
 	}
 
 	ch := make(chan int)
-	replies := make(map[int](*AppendEntriesReply))
+	replies := make(map[int](*HeartBeatReply))
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
-		req := &AppendEntriesArgs{rf.currentTerm, rf.me}
-		rep := &AppendEntriesReply{}
+		req := &HeartBeatArgs{LeaderTerm: rf.currentTerm, LeaderID: rf.me}
+		rep := &HeartBeatReply{}
 		replies[i] = rep
 		go rf.sendEntries(ch, i, req, rep)
 	}
@@ -389,12 +436,8 @@ func (rf *Raft) resetTimer() {
 	rf.timerDuration = time.Millisecond * time.Duration(sleepFor)
 }
 
-// TODO: What if we get these RPCs in the middle of an election as candidate,
-// or when we're the leader.
-// If we're updating term, we must also set votedFor to -1.
-
-// AppendEntries is the handler for the peer which RECEIVES an append entry rpc.
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+// HeartBeats is the handler for the peer which RECEIVES an append entry rpc.
+func (rf *Raft) HeartBeats(args *HeartBeatArgs, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -434,7 +477,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	rf.currentTerm = args.LeaderTerm
+	reply.Success = rf.updateLog(args)
+	// Either way, this guy's a valid leader, so reset the timer.
 	rf.resetTimer()
+}
+
+// Invariant: MUST acquire lock before calling this.
+func (rf *Raft) updateLog(args *HeartBeatArgs) bool {
+	// So, at this point, we've updated the term, and we're a follower.
+	// Now, we check if our log is synced with the leaders.
+	success := false
+	if len(args.LeaderEntries) > 0 {
+		// Leader wants us to add some entries.
+		if args.LeaderPrevLogIndex >= 0 {
+			// Leader has a log at the prev log index.
+			if args.LeaderPrevLogIndex < len(rf.logs) {
+				if rf.logs[args.LeaderPrevLogIndex].AppendTerm == args.LeaderPrevLogTerm {
+					// We have the exact same log.
+					success = true
+				}
+				// We have a different prev log, which is a problem.
+				// We're not in sync with the leader.
+				// Basically drop everything after and including previous
+				// log index.
+				rf.logs = rf.logs[:args.LeaderPrevLogIndex]
+				success = false
+			} else {
+				// We don't even have enough logs to match, in this case, it's
+				// prob okay to do nothing, but leaving it here as a case for
+				// reasoning purposes.
+				success = false
+			}
+		} else {
+			success = true
+		}
+
+		if success {
+			// If leader has no previous entries, then we're matching
+			// by default.
+			// args.LeaderPrevLogIndex must be -1.
+			for i := 0; i < len(args.LeaderEntries); i++ {
+				ii := args.LeaderPrevLogIndex + 1 + i
+				if ii < len(rf.logs) {
+					rf.logs[ii] = args.LeaderEntries[i]
+				} else {
+					rf.logs = append(rf.logs, args.LeaderEntries[i])
+				}
+			}
+		}
+	}
+	return success
 }
 
 func (rf *Raft) sendRequestVote(
@@ -444,8 +536,8 @@ func (rf *Raft) sendRequestVote(
 }
 
 func (rf *Raft) sendEntries(
-	replyCh chan<- int, server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	_ = rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	replyCh chan<- int, server int, args *HeartBeatArgs, reply *HeartBeatReply) {
+	_ = rf.peers[server].Call("Raft.HeartBeats", args, reply)
 	replyCh <- server
 }
 
@@ -510,13 +602,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, -1, false
 	}
 
-	index := -1
-	term := -1
-	isLeader := true
-
-	// Your code here (2B).
-
-	return index, term, isLeader
+	// We want to send this to every server.
+	toAppend := raftLog{rf.currentTerm, command}
+	rf.logs = append(rf.logs, &toAppend)
+	go rf.startAgreement()
+	return len(rf.logs) - 1, toAppend.AppendTerm, true
 }
 
 //

@@ -116,9 +116,8 @@ func (rf *Raft) initLeader() {
 		// but that's fine. I guess, we just won't send anything.
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 
-		// Initially, we assume that exactly 0
-		// logs on the leader are replicated on the server.
-		// So, in this case making this -1 is fine.
+		// Initially, we assume every single log entry
+		// has been replicated. So, making it this is fine.
 		rf.matchIndex[i] = rf.lastLogIndex()
 	}
 }

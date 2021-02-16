@@ -103,6 +103,26 @@ type Raft struct {
 	matchIndex map[int]int // index of highest log entry known to be replicated on server.
 }
 
+// Only call this on a leader exactly when
+// it's made the leader.
+// Invariant: HOLD the lock.
+func (rf *Raft) initLeader() {
+	// As soon as a node becomes leader, we need to do some init work.
+	rf.nextIndex = make(map[int]int)
+	rf.matchIndex = make(map[int]int)
+
+	for i := 0; i < len(rf.peers); i++ {
+		// This could be equal to the length of the list,
+		// but that's fine. I guess, we just won't send anything.
+		rf.nextIndex[i] = rf.lastLogIndex() + 1
+
+		// Initially, we assume that exactly 0
+		// logs on the leader are replicated on the server.
+		// So, in this case making this -1 is fine.
+		rf.matchIndex[i] = rf.lastLogIndex()
+	}
+}
+
 // Me is used for some whack debugging.
 func (rf *Raft) Me() int {
 	return rf.me
@@ -289,6 +309,7 @@ func (rf *Raft) startElection() {
 			if !justReturn && rf.hasMajority(numVotes) {
 				// Majority voted us in.
 				rf.state = leader
+				rf.initLeader()
 				go rf.sendAppendEntries()
 
 				// Majority voted us in. I don't think we need to

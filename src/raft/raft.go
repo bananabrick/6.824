@@ -105,7 +105,6 @@ type Raft struct {
 	lastApplied int // Index of last log entry applied to state machine.
 
 	// These are only relevant for the leader.
-	// TODO: Initialize these when you become leader.
 	nextIndex  map[int]int // index of next log entry to send to server.
 	matchIndex map[int]int // index of highest log entry known to be replicated on server.
 }
@@ -123,9 +122,8 @@ func (rf *Raft) initLeader() {
 		// but that's fine. I guess, we just won't send anything.
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 
-		// Initially, we assume every single log entry
-		// has been replicated. So, making it this is fine.
-		rf.matchIndex[i] = rf.lastLogIndex()
+		// Assume that nothing has been replicated on the followers.
+		rf.matchIndex[i] = -1
 	}
 }
 
@@ -188,7 +186,6 @@ func (rf *Raft) readPersist(data []byte) {
 
 // RequestVoteArgs is send to the peer we send [RequestVote] RPC to.
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
 	CandidateTerm int
 	CandidateID   int
 
@@ -203,28 +200,12 @@ type RequestVoteArgs struct {
 
 // RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
 type RequestVoteReply struct {
-	// Your data here (2A).
 	PeerTerm    int  // This is the term of the peer which candidate sent [RequestVote] to.
 	VoteGranted bool // Whether the peer voted for the candidate.
 }
 
-// Note that I'm separating heartbeats with appendEntries.
-// I'm not sure why I must not accept a heartbeat from a leader
-// if the entries don't match. The leader could take a while to
-// make entries match and I don't want to time out.
-
-// AppendEntriesArgs is used by the AppendEntries RPC to
-// tell a follower to update its log.
-type AppendEntriesArgs struct {
-}
-
-// AppendEntriesReply is used by the AppendEntries RPC to
-// signal to the leader if the append was a success.
-type AppendEntriesReply struct {
-}
-
 // HeartBeatArgs is sent to the peer in the
-// [HeartBeat] RPC to.
+// [HeartBeat] RPC.
 // Note that only the leader should send these out.
 // However, there are cases when previous leaders could
 // potentially send these out. In that case, we reject
@@ -233,7 +214,7 @@ type HeartBeatArgs struct {
 	LeaderTerm int
 	LeaderID   int
 
-	// We need these property to maintain the invariant
+	// We need these properties to maintain the invariant
 	// that if two log entries have the same term and same index, then
 	// they and all the preceding logs are the same.
 	// index of log entry preceding the new ones.
@@ -424,7 +405,6 @@ func (rf *Raft) sendHearts() {
 		rf.mu.Unlock()
 		wait--
 	}
-
 }
 
 // Resets the election timer.
@@ -495,13 +475,13 @@ func (rf *Raft) updateLog(args *HeartBeatArgs) bool {
 				if rf.logs[args.LeaderPrevLogIndex].AppendTerm == args.LeaderPrevLogTerm {
 					// We have the exact same log.
 					success = true
+				} else {
+					// We have a different prev log, which is a problem.
+					// We're not in sync with the leader.
+					// Basically drop everything after and including previous
+					// log index.
+					success = false
 				}
-				// We have a different prev log, which is a problem.
-				// We're not in sync with the leader.
-				// Basically drop everything after and including previous
-				// log index.
-				rf.logs = rf.logs[:args.LeaderPrevLogIndex]
-				success = false
 			} else {
 				// We don't even have enough logs to match, in this case, it's
 				// prob okay to do nothing, but leaving it here as a case for
@@ -509,6 +489,7 @@ func (rf *Raft) updateLog(args *HeartBeatArgs) bool {
 				success = false
 			}
 		} else {
+			// Leader has no previous entries. In this case we match by default.
 			success = true
 		}
 
@@ -519,7 +500,13 @@ func (rf *Raft) updateLog(args *HeartBeatArgs) bool {
 			for i := 0; i < len(args.LeaderEntries); i++ {
 				ii := args.LeaderPrevLogIndex + 1 + i
 				if ii < len(rf.logs) {
-					rf.logs[ii] = args.LeaderEntries[i]
+					if rf.logs[ii].AppendTerm != args.LeaderEntries[i].AppendTerm {
+						// These logs are in the same position, but different terms.
+						rf.logs = rf.logs[:ii]
+						rf.logs = append(rf.logs, args.LeaderEntries[i])
+					}
+					// If the terms match, then the logs MUST be
+					// the same anyway.
 				} else {
 					rf.logs = append(rf.logs, args.LeaderEntries[i])
 				}

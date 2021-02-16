@@ -67,6 +67,11 @@ const (
 	timerHigh = 700
 )
 
+type raftLog struct {
+	appendTerm int         // term when log was initially appended to some server.
+	command    interface{} // The command which was sent by the client.
+}
+
 // Raft is a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -75,14 +80,27 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+	// 2A state
 	currentTerm   int           // Starts out at 0
 	votedFor      int           // This is just [peers] index. -1 if haven't voted for anyone.
 	state         int           // Starts out as follower
 	lastContact   time.Time     // Don't need to sync time for these labs.
 	timerDuration time.Duration // Keeps track of how long the current election timer is.
+
+	// 2B state
+	logs [](*raftLog) // List of logs which have been appended.
+
+	// Pulled these straight out of figure 2 in the paper.
+	// Basically tells the node what is okay to apply and how much should
+	// be applied.
+	// Basically apply everything from [lastApplied + 1, commitIndex].
+	commitIndex int // Index of highest log entry known to be committed.
+	lastApplied int // Index of last log entry applied to state machine.
+
+	// These are only relevant for the leader.
+	// TODO: Initialize these when you become leader.
+	nextIndex  map[int]int // index of next log entry to send to server.
+	matchIndex map[int]int // index of highest log entry known to be replicated on server.
 }
 
 // Me is used for some whack debugging.
@@ -147,6 +165,14 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	CandidateTerm int
 	CandidateID   int
+
+	// This is pretty crucial.
+	// Giving candidates this info allows
+	// them to vote in a way which ensures
+	// the leader completeness invarian
+	// (i.e. leader has all logs which were committed previously)
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 // RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
@@ -187,6 +213,19 @@ func (rf *Raft) electionTimer() {
 	}
 }
 
+// Returns -1 if log is empty.
+func (rf *Raft) lastLogIndex() int {
+	return len(rf.logs) - 1
+}
+
+// Returns -1 if log is empty.
+func (rf *Raft) lastLogTerm() int {
+	if len(rf.logs) == 0 {
+		return -1
+	}
+	return rf.logs[len(rf.logs)-1].appendTerm
+}
+
 // Note that election is only allowed to commit its results
 // if the term when it started is equal to the term when it gets
 // the results back.
@@ -215,7 +254,7 @@ func (rf *Raft) startElection() {
 			// Don't want to send RPC to ourself.
 			continue
 		}
-		req := &RequestVoteArgs{electionTerm, rf.me}
+		req := &RequestVoteArgs{electionTerm, rf.me, rf.lastLogIndex(), rf.lastLogTerm()}
 		rep := &RequestVoteReply{}
 		replies[i] = rep
 		go rf.sendRequestVote(replyCh, i, req, rep)
@@ -414,15 +453,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.currentTerm = args.CandidateTerm
-	reply.VoteGranted = rf.votedFor == -1 || rf.votedFor == args.CandidateID
+
+	// Basic voting criteria, make sure we've voted for no one, or voted
+	// for the same candidate(for dup requests I guess).
+	haventVotedYet := rf.votedFor == -1 || rf.votedFor == args.CandidateID
+	candLogUpToDate := rf.lastLogTerm() < args.LastLogTerm
+	candLogUpToDate = candLogUpToDate ||
+		// Does the <= here make sense?
+		// If log lens are equal and last terms are equal, then candidates
+		// log is exactly the same as ours. I think it's okay to vote.
+		(rf.lastLogTerm() == args.LastLogTerm && len(rf.logs) <= args.LastLogIndex+1)
+	reply.VoteGranted = haventVotedYet && candLogUpToDate
 	if reply.VoteGranted {
 		rf.votedFor = args.CandidateID
 		rf.resetTimer()
 	}
 }
 
-//
-// the service using Raft (e.g. a k/v server) wants to start
+// Start is used by the service using Raft (e.g. a k/v server) if it wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
 // agreement and return immediately. there is no guarantee that this
@@ -434,8 +482,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state != leader {
+		return -1, -1, false
+	}
+
 	index := -1
 	term := -1
 	isLeader := true
@@ -481,10 +535,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	// 2A initialization
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.state = follower
+
+	// 2B initialization
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+
+	// Note: nextIndex, and mapIndex only need to be initialized
+	// if the server becomes the leader.
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

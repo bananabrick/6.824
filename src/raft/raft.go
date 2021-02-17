@@ -43,7 +43,7 @@ func min(a, b int) int {
 	return b
 }
 
-//
+// ApplyMsg is used by the raft library to communicate with the state machine.
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -53,7 +53,6 @@ func min(a, b int) int {
 // in Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
-//
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
@@ -398,7 +397,12 @@ func (rf *Raft) sendHearts() {
 				rf.nextIndex[replyFrom] = max(rf.nextIndex[replyFrom], rf.matchIndex[replyFrom]+1)
 			} else {
 				// If this didn't match, then try to fix it.
-				newNext := args.PrevLogIndex
+				// We could potentially try a binary search here.
+				// newNext := args.PrevLogIndex
+				// lo := rf.matchIndex[replyFrom] + 1
+				// hi := args.PrevLogIndex
+				// newNext := lo + (hi-lo)/2
+				newNext := rf.matchIndex[replyFrom] + 1
 				if newNext > rf.matchIndex[replyFrom] {
 					// Just in case we got success from a different RPC.
 					rf.nextIndex[replyFrom] = newNext
@@ -454,6 +458,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// If that node sends out ae, then it think it's the leader
 		// for that term. But we got voted in for that term for sure.
 		// So, it can't be voted in, and it can't send out ae.
+		// This is hacky, cause we're basically copying over
+		// the entire log. Don't want to send RPCs one entry
+		// at a time either, so implement a faster method.
 		if args.LeaderTerm > rf.currentTerm {
 			rf.state = follower
 		} else if args.LeaderTerm == rf.currentTerm {

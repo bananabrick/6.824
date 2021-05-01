@@ -70,8 +70,8 @@ const (
 const (
 	// Not sure how long 1 election will take?
 	// Hopefully less than [timerLow]ms.
-	heartBeat = 150
-	timerLow  = 450
+	heartBeat = 110
+	timerLow  = 300
 	timerHigh = 700
 )
 
@@ -97,7 +97,7 @@ type Raft struct {
 	state         int           // Starts out as follower
 	lastContact   time.Time     // Don't need to sync time for these labs.
 	timerDuration time.Duration // Keeps track of how long the current election timer is.
-	Logs          [](*RLog)
+	Logs          [](RLog)
 	commitIndex   int // Index known by this node to be committed
 	lastApplied   int // Index for log which was lastApplied by this node.
 
@@ -164,7 +164,7 @@ type AppendEntriesArgs struct {
 	LeaderID          int
 	PrevLogIndex      int
 	PrevLogTerm       int
-	Entries           [](*RLog)
+	Entries           [](RLog)
 	LeaderCommitIndex int
 }
 
@@ -191,6 +191,7 @@ func (rf *Raft) electionTimer() {
 
 // Inits the raft state for a leader just after
 // it wins an election.
+// Invariant: Acquire lock before calling this.
 func (rf *Raft) initLeaderState() {
 	rf.nextIndex = make(map[int]int)
 	rf.matchIndex = make(map[int]int)
@@ -315,7 +316,7 @@ func (rf *Raft) sendHearts() {
 		}
 		prevLogIndex := rf.nextIndex[i] - 1
 		prevLogTerm := rf.aLogTerm(prevLogIndex)
-		var entries [](*RLog)
+		var entries [](RLog)
 		if rf.lastLogIndex() >= rf.nextIndex[i] {
 			entries = rf.Logs[rf.nextIndex[i]:]
 		}
@@ -328,6 +329,7 @@ func (rf *Raft) sendHearts() {
 	}
 
 	wait := len(rf.peers) - 1
+	leaderTerm := rf.CurrentTerm
 	rf.mu.Unlock()
 	justReturn := false
 	for wait > 0 {
@@ -335,7 +337,7 @@ func (rf *Raft) sendHearts() {
 		replyFrom := <-ch
 		rf.mu.Lock()
 		// TODO: this might be potentially, buggy.
-		if rf.state != leader {
+		if rf.state != leader || rf.CurrentTerm != leaderTerm {
 			justReturn = true
 		}
 		if !justReturn && replies[replyFrom].PeerTerm > rf.CurrentTerm {
@@ -468,6 +470,7 @@ func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
 
 func (rf *Raft) sendRequestVote(
 	replyCh chan<- int, server int, args *RequestVoteArgs, reply *RequestVoteReply) {
+
 	_ = rf.peers[server].Call("Raft.RequestVote", args, reply)
 	replyCh <- server
 }
@@ -502,6 +505,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	rf.CurrentTerm = args.CandidateTerm
+	rf.persist()
 	notAlreadyVoted := rf.VotedFor == -1 || rf.VotedFor == args.CandidateID
 	canVote := rf.lastLogTerm() == args.LastLogTerm && rf.lastLogIndex() <= args.LastLogIndex
 	canVote = canVote || rf.lastLogTerm() < args.LastLogTerm
@@ -510,7 +514,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.VotedFor = args.CandidateID
 		rf.resetTimer()
 	}
-	rf.persist()
 }
 
 //
@@ -537,7 +540,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// We kinda just let this be taken to the other nodes
 	// along with a heartbeat. We don't want to do extra shit!
-	newLog := &RLog{command, rf.CurrentTerm}
+	newLog := RLog{command, rf.CurrentTerm}
 	rf.Logs = append(rf.Logs, newLog)
 	rf.persist()
 
@@ -556,7 +559,7 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 		// TODO: Check if the sleep constant needs to be tuned.
 		time.Sleep(time.Millisecond * time.Duration(30))
 		rf.mu.Lock()
-		if rf.lastApplied < rf.commitIndex {
+		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			// Again, we need to expose index + 1 for the tests
 			// since it expects 1 based indexing.
@@ -598,7 +601,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 			}
 
 			// TODO: Make sure that matchIndex is also upto date for the leader.
-			// Iterate from the back to get the firs valid log index
+			// Iterate from the back to get the first valid log index
 			// which is the largest.
 			for i := len(indices) - 1; i >= 0; i-- {
 				if i == len(indices)-1 {
@@ -618,7 +621,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 	}
 }
 
-//
+// Kill long running go routines
 // the tester doesn't halt goroutines created by Raft after each test,
 // but it does call the Kill() method. your code can use killed() to
 // check whether Kill() has been called. the use of atomic avoids the
@@ -628,7 +631,6 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 // up CPU time, perhaps causing later tests to fail and generating
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
-//
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 }
@@ -675,7 +677,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var CurrentTerm int
 	var VotedFor int
-	var Logs [](*RLog)
+	var Logs [](RLog)
 
 	// Todo: is it safe to ignore the error checking here.
 	d.Decode(&CurrentTerm)

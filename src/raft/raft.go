@@ -558,12 +558,17 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 		}
 		// TODO: Check if the sleep constant needs to be tuned.
 		time.Sleep(time.Millisecond * time.Duration(30))
+
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
+			toSend := ApplyMsg{true, rf.Logs[rf.lastApplied].Command, rf.lastApplied + 1}
+
 			// Again, we need to expose index + 1 for the tests
 			// since it expects 1 based indexing.
-			ch <- ApplyMsg{true, rf.Logs[rf.lastApplied].Command, rf.lastApplied + 1}
+			rf.mu.Unlock()
+			ch <- toSend
+			rf.mu.Lock()
 		}
 		rf.mu.Unlock()
 	}

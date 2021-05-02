@@ -1,4 +1,4 @@
 #!/bin/bash
-go test -race -run 2A
-go test -race -run 2B
-go test -race -run 2C
+go test -run 2A
+go test -run 2B
+go test -run 2C

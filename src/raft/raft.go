@@ -120,7 +120,6 @@ func (rf *Raft) hasMajority(n int) bool {
 
 // RequestVoteArgs is send to the peer we send [RequestVote] RPC to.
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
 	CandidateTerm int
 	CandidateID   int
 	LastLogIndex  int
@@ -147,7 +146,6 @@ func (rf *Raft) lastLogTerm() int {
 
 // RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
 type RequestVoteReply struct {
-	// Your data here (2A).
 	PeerTerm    int  // This is the term of the peer which candidate sent [RequestVote] to.
 	VoteGranted bool // Whether the peer voted for the candidate.
 }

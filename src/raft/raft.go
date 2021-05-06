@@ -551,6 +551,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIndex[rf.me]++
 	// Note that we're using 0 based index, but the client expects
 	// 1 based indexing.
+	go rf.sendHearts()
 	return len(rf.Logs), rf.CurrentTerm, true
 }
 

@@ -97,7 +97,7 @@ type Raft struct {
 	state         int           // Starts out as follower
 	lastContact   time.Time     // Don't need to sync time for these labs.
 	timerDuration time.Duration // Keeps track of how long the current election timer is.
-	Logs          [](RLog)
+	Logs          [](*RLog)
 	commitIndex   int // Index known by this node to be committed
 	lastApplied   int // Index for log which was lastApplied by this node.
 
@@ -164,7 +164,7 @@ type AppendEntriesArgs struct {
 	LeaderID          int
 	PrevLogIndex      int
 	PrevLogTerm       int
-	Entries           [](RLog)
+	Entries           [](*RLog)
 	LeaderCommitIndex int
 }
 
@@ -316,9 +316,11 @@ func (rf *Raft) sendHearts() {
 		}
 		prevLogIndex := rf.nextIndex[i] - 1
 		prevLogTerm := rf.aLogTerm(prevLogIndex)
-		var entries [](RLog)
+		var entries [](*RLog)
 		if rf.lastLogIndex() >= rf.nextIndex[i] {
-			entries = rf.Logs[rf.nextIndex[i]:]
+			log := make([]*RLog, len(rf.Logs) - rf.nextIndex[i])
+			copy(log, rf.Logs[rf.nextIndex[i]:])
+			entries = log
 		}
 		req := &AppendEntriesArgs{
 			rf.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
@@ -336,7 +338,7 @@ func (rf *Raft) sendHearts() {
 		// We got a reply from a peer.
 		replyFrom := <-ch
 		rf.mu.Lock()
-		// TODO: this might be potentially, buggy.
+
 		if rf.state != leader || rf.CurrentTerm != leaderTerm {
 			justReturn = true
 		}
@@ -540,7 +542,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// We kinda just let this be taken to the other nodes
 	// along with a heartbeat. We don't want to do extra shit!
-	newLog := RLog{command, rf.CurrentTerm}
+	// TODO: Might need to send heatbeats from here for speedup.
+	newLog := &RLog{command, rf.CurrentTerm}
 	rf.Logs = append(rf.Logs, newLog)
 	rf.persist()
 
@@ -682,7 +685,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var CurrentTerm int
 	var VotedFor int
-	var Logs [](RLog)
+	var Logs [](*RLog)
 
 	// Todo: is it safe to ignore the error checking here.
 	d.Decode(&CurrentTerm)

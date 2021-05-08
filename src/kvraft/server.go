@@ -53,13 +53,12 @@ type KVServer struct {
     // yet processed a reply that SOMETHING got committed at the expected index.
     pendingCommits map[int]*pendingCommit
 
-    // We're waiting for an "ack" from the [Clerk] that the requests in here have been seen.
-    // If a sequence num is here, then it means that we've applied it to state, but
-    // not yet processed an "ack" from the client.
-    pendingAck map[clientIDT](map[int]bool)
-
-    // SequenceSeenUntil for each client. Can start deleting the lower ones.
-    sequenceSeen map[clientIDT]int
+    // Highest sequence number from the client which has been applied.
+    // Note that since the client only makes one request at a time,
+    // the sequence numbers which are returned from the [applyCh] are
+    // non-decreasing. For that reason, we can just ignore sequence nums
+    // which are lower than sequence applied.
+    sequenceApplied map[clientIDT]int
 }
 
 
@@ -89,8 +88,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
     kv.kvs = make(map[string]string)
     kv.pendingCommits = make(map[int]*pendingCommit)
-    kv.pendingAck = make(map[clientIDT](map[int]bool))
-    kv.sequenceSeen = make(map[clientIDT]int)
+    kv.sequenceApplied = make(map[clientIDT]int)
 
     go kv.readFromApplyCh()
     return kv
@@ -116,15 +114,14 @@ func (kv *KVServer) readFromApplyCh() {
         opCommitted := (commitedMsg.Command).(Op)
         kv.mu.Lock()
         expectedCommit := kv.pendingCommits[commitedMsg.CommandIndex]
-        kv.initMaps(opCommitted.ClientID)
-        _, ok := kv.pendingAck[opCommitted.ClientID][opCommitted.SequenceNum]
+
         dprintln(kv.me, opCommitted, commitedMsg.CommandIndex, expectedCommit)
-        dprintln("sequences", opCommitted.SequenceNum, kv.sequenceSeen[opCommitted.ClientID])
+        dprintln("sequences", opCommitted.SequenceNum, kv.sequenceApplied[opCommitted.ClientID])
 
         // Todo: We're currently not dropping entries from [pendingAck], and this could
         // potentially baloon up in size.
         // && opCommitted.SequenceNum > kv.sequenceSeen[opCommitted.ClientID] 
-        if !ok {
+        if kv.sequenceApplied[opCommitted.ClientID] < opCommitted.SequenceNum {
             dprintln("committing")
             // Not in pending ack, and has never been removed from pending ack.
             // We know that it hasn't been removed from pending ack, cause we remove
@@ -142,7 +139,7 @@ func (kv *KVServer) readFromApplyCh() {
                     kv.kvs[opCommitted.Key] = opCommitted.Value
                 }
             }
-            kv.pendingAck[opCommitted.ClientID][opCommitted.SequenceNum] = true
+            kv.sequenceApplied[opCommitted.ClientID] = opCommitted.SequenceNum
         }
  
         // TODO: Remove from expectedCommit.
@@ -170,23 +167,6 @@ func (kv *KVServer) readFromApplyCh() {
     }
 }
 
-// Just inits the nested maps if they haven't been inited already.
-// Invariant: Hold lock.
-func (kv *KVServer) initMaps(clientID clientIDT) {
-    _, ok := kv.pendingAck[clientID]
-    if !ok {
-        kv.pendingAck[clientID] = make(map[int]bool)
-    }
-}
-
-// Invariant: Hold lock.
-func (kv *KVServer) updateHighestSequenceForClient(cid clientIDT, n int) {
-    prevHigh := kv.sequenceSeen[cid]
-    if n > prevHigh {
-        kv.sequenceSeen[cid] = n
-    }
-}
-
 // Get RPC handler
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
     kv.mu.Lock()
@@ -204,8 +184,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
     }
 
     cid := clientIDT(args.ClientID)
-    kv.initMaps(cid)
-    kv.updateHighestSequenceForClient(cid, args.SeenSeqUntil)
 
     expIndex, _, isLeader := kv.rf.Start(newOp)
     if !isLeader {
@@ -289,8 +267,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
     }
 
     cid := clientIDT(args.ClientID)
-    kv.initMaps(cid)
-    kv.updateHighestSequenceForClient(cid, args.SeenSeqUntil)
 
     expIndex, _, isLeader := kv.rf.Start(newOp)
     if !isLeader {

@@ -113,6 +113,14 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
+// IsLeader is used to query if node thinks it's the leader.
+// Just for debugging.
+func (rf *Raft) IsLeader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == leader
+}
+
 // Basic check to see if current node has majority.
 func (rf *Raft) hasMajority(n int) bool {
 	return 2*n > len(rf.peers)
@@ -275,6 +283,8 @@ func (rf *Raft) startElection() {
 				// Majority voted us in. I don't think we need to
 				// care about other votes for this election.
 				justReturn = true
+
+				// fmt.Println("have become leader", rf.me)
 			}
 		}
 		rf.mu.Unlock()

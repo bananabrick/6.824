@@ -4,6 +4,7 @@ import (
 	"../labrpc"
 	"crypto/rand"
 	"math/big"
+	"time"
 )
 
 // Clerk is used by the client to talk to the server.
@@ -74,10 +75,10 @@ func (ck *Clerk) Get(key string) string {
 		SeenSeqUntil: nextSeqNum - 1,
 	}
 	reply := &GetReply{}
-
 	for {
 		var ok bool
-		ok = ck.servers[ck.currLeader].Call("KVServer.Get", args, reply)
+		dprintln("client sending get to", ck.currLeader, ck.clientID, nextSeqNum)
+		ok = ck.makeRPCWithTimeout("KVServer.Get", args, reply, 200)
 		if ok {
 			// Request went through.
 			if reply.Err == OK {
@@ -108,7 +109,6 @@ func (ck *Clerk) Get(key string) string {
 // of the request completing successfully.
 func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 	nextSeqNum := ck.nextSeqNum()
-	dprintln(key, ",", value, ck.clientID)
 	args := &PutAppendArgs{
 		Key: key,
 		Value: value,
@@ -120,10 +120,10 @@ func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 		SeenSeqUntil: nextSeqNum - 1,
 	}
 	reply := &PutAppendReply{}
-
 	for {
 		var ok bool
-		ok = ck.servers[ck.currLeader].Call("KVServer.PutAppend", args, reply)
+		dprintln("client sending update to", ck.currLeader, ck.clientID, nextSeqNum)
+		ok = ck.makeRPCWithTimeout("KVServer.PutAppend", args, reply, 200)
 		if ok && reply.Err == OK {
 			// Request went through.
 			ck.seenResponse = max(ck.seenResponse, args.SequenceNum)
@@ -133,6 +133,22 @@ func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 		// Try a new leader.
 		ck.setNewLeader()
 	}
+}
+
+func (ck *Clerk) makeRPCWithTimeout(name string, args interface{}, reply interface{}, timeout int) bool {
+	waitCh := make(chan bool)
+	go func() {
+		ok := ck.servers[ck.currLeader].Call(name, args, reply)
+		waitCh <- ok
+	}()
+
+	var ok bool
+	select {
+    case ok = <-waitCh:
+        return ok
+    case <-time.After(time.Millisecond * time.Duration(timeout)):
+        return false
+    }
 }
 
 // Put is used by the client to update or put a key value pair.

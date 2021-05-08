@@ -119,7 +119,9 @@ func (kv *KVServer) readFromApplyCh() {
 		kv.initMaps(opCommitted.ClientID)
 		_, ok := kv.pendingAck[opCommitted.ClientID][opCommitted.SequenceNum]
 		dprintln(kv.me, opCommitted, commitedMsg.CommandIndex, expectedCommit)
-		if !ok && opCommitted.SequenceNum > kv.sequenceSeen[opCommitted.ClientID] {
+		dprintln("sequences", opCommitted.SequenceNum, kv.sequenceSeen[opCommitted.ClientID])
+		// && opCommitted.SequenceNum > kv.sequenceSeen[opCommitted.ClientID] 
+		if !ok {
 			dprintln("committing")
 			// Not in pending ack, and has never been removed from pending ack.
 			// We know that it hasn't been removed from pending ack, cause we remove
@@ -235,7 +237,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.pendingCommits[expIndex] = pendingCommit
 	kv.mu.Unlock()
 
+	dprintln("pending1", kv.me, pendingCommit)
 	worked := <-pendingCommit.waitCh
+	dprintln("pending2", kv.me, pendingCommit)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -319,9 +323,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.pendingCommits[expIndex] = pendingCommit
 	kv.mu.Unlock()
-
+	dprintln("pending1", kv.me, kv.rf.Me(), pendingCommit)
 	worked := <-pendingCommit.waitCh
-
+	dprintln("pending2", kv.me, kv.rf.Me(), pendingCommit)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if worked {

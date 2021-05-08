@@ -223,21 +223,24 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 		if partitions {
 			// Allow the clients to perform some operations without interruption
 			time.Sleep(1 * time.Second)
+			dprintln("partitioning")
 			go partitioner(t, cfg, ch_partitioner, &done_partitioner)
 		}
 		time.Sleep(5 * time.Second)
 
 		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
-
+		dprintln("hereeeee")
 		if partitions {
 			// log.Printf("wait for partitioner\n")
 			<-ch_partitioner
+			dprintln("here2")
 			// reconnect network and submit a request. A client may
 			// have submitted a request in a minority.  That request
 			// won't return until that server discovers a new term
 			// has started.
 			cfg.ConnectAll()
+			dprintln("connected all")
 			// wait for a while so that we have a new term
 			time.Sleep(electionTimeout)
 		}

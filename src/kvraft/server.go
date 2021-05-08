@@ -120,6 +120,9 @@ func (kv *KVServer) readFromApplyCh() {
 		_, ok := kv.pendingAck[opCommitted.ClientID][opCommitted.SequenceNum]
 		dprintln(kv.me, opCommitted, commitedMsg.CommandIndex, expectedCommit)
 		dprintln("sequences", opCommitted.SequenceNum, kv.sequenceSeen[opCommitted.ClientID])
+
+		// Todo: We're currently not dropping entries from [pendingAck], and this could
+		// potentially baloon up in size.
 		// && opCommitted.SequenceNum > kv.sequenceSeen[opCommitted.ClientID] 
 		if !ok {
 			dprintln("committing")

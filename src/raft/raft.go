@@ -449,6 +449,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 // Invariant: Hold lock.
+// Note that the leader does have the authority to do whatever it wants with our
+// logs.
 func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
 	if rf.aLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		// No match.

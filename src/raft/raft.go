@@ -84,7 +84,9 @@ type RLog struct {
 // We'll start off with an empty [SnapShot].
 // We need to keep the snapshot and the remaining log in sync.
 type SnapShot struct {
-	LogTerm  int // Term of log entry at [LogIndex]
+
+	// [LogTerm], [LogIndex], [Kvs] must only be updated when taking a new snapshot.
+	LogTerm  int // Term of log entry at [LogIndex].
 	LogIndex int // The index applied by the kvs, right before Snapshotting.
 
 	// Kvs is getting persisted on every persist. Might have to hack around that.
@@ -114,7 +116,7 @@ type Raft struct {
 	commitIndex   int           // Index known by this node to be committed
 	lastApplied   int           // Index for log which was lastApplied by this node.
 
-	persistentState *RaftPersistent
+	PersistentState *RaftPersistent
 
 	// This state is only valid for leaders once they
 	// win an election and is only init after they win.
@@ -163,7 +165,7 @@ func (rf *Raft) dropLog(n int) {
 // index must be in-range.
 // Invariant: Acquire lock first.
 func (rf *Raft) indexLog(n int) *RLog {
-	return rf.persistentState.SnapShot.SnapLog[n]
+	return rf.PersistentState.SnapShot.SnapLog[n]
 }
 
 // Converts a 0-based index in the overall log
@@ -176,20 +178,20 @@ func (rf *Raft) indexInLog(n int) {
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.persistentState.SnapShot.SnapLog) - 1
+	return len(rf.PersistentState.SnapShot.SnapLog) - 1
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) aLogTerm(n int) int {
-	if n < 0 || n >= len(rf.persistentState.SnapShot.SnapLog) {
+	if n < 0 || n >= len(rf.PersistentState.SnapShot.SnapLog) {
 		return -1
 	}
-	return rf.persistentState.SnapShot.SnapLog[n].AppendTerm
+	return rf.PersistentState.SnapShot.SnapLog[n].AppendTerm
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) lastLogTerm() int {
-	return rf.aLogTerm(len(rf.persistentState.SnapShot.SnapLog) - 1)
+	return rf.aLogTerm(len(rf.PersistentState.SnapShot.SnapLog) - 1)
 }
 
 // RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
@@ -268,10 +270,10 @@ func (rf *Raft) startElection() {
 		return
 	}
 
-	rf.persistentState.CurrentTerm++
-	electionTerm := rf.persistentState.CurrentTerm
+	rf.PersistentState.CurrentTerm++
+	electionTerm := rf.PersistentState.CurrentTerm
 	rf.state = candidate
-	rf.persistentState.VotedFor = rf.me
+	rf.PersistentState.VotedFor = rf.me
 	rf.persist()
 	rf.resetTimer()
 
@@ -301,14 +303,14 @@ func (rf *Raft) startElection() {
 		replyFrom := <-replyCh
 		rf.mu.Lock()
 		if !justReturn {
-			if rf.state != candidate || rf.persistentState.CurrentTerm > electionTerm {
+			if rf.state != candidate || rf.PersistentState.CurrentTerm > electionTerm {
 				// We're no longer a candidate or we started another election
 				// eitherway, this election no longer matters.
 				justReturn = true
 			} else if replies[replyFrom].PeerTerm > electionTerm {
-				rf.persistentState.CurrentTerm = replies[replyFrom].PeerTerm
+				rf.PersistentState.CurrentTerm = replies[replyFrom].PeerTerm
 				rf.state = follower
-				rf.persistentState.VotedFor = -1
+				rf.PersistentState.VotedFor = -1
 				justReturn = true
 				rf.persist()
 			} else if replies[replyFrom].VoteGranted {
@@ -365,12 +367,12 @@ func (rf *Raft) sendHearts() {
 		prevLogTerm := rf.aLogTerm(prevLogIndex)
 		var entries [](*RLog)
 		if rf.lastLogIndex() >= rf.nextIndex[i] {
-			log := make([]*RLog, len(rf.persistentState.SnapShot.SnapLog)-rf.nextIndex[i])
-			copy(log, rf.persistentState.SnapShot.SnapLog[rf.nextIndex[i]:])
+			log := make([]*RLog, len(rf.PersistentState.SnapShot.SnapLog)-rf.nextIndex[i])
+			copy(log, rf.PersistentState.SnapShot.SnapLog[rf.nextIndex[i]:])
 			entries = log
 		}
 		req := &AppendEntriesArgs{
-			rf.persistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
+			rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
 		rep := &AppendEntriesReply{}
 		replies[i] = rep
 		allArgs[i] = req
@@ -378,7 +380,7 @@ func (rf *Raft) sendHearts() {
 	}
 
 	wait := len(rf.peers) - 1
-	leaderTerm := rf.persistentState.CurrentTerm
+	leaderTerm := rf.PersistentState.CurrentTerm
 	rf.mu.Unlock()
 	justReturn := false
 	for wait > 0 {
@@ -386,14 +388,14 @@ func (rf *Raft) sendHearts() {
 		replyFrom := <-ch
 		rf.mu.Lock()
 
-		if rf.state != leader || rf.persistentState.CurrentTerm != leaderTerm {
+		if rf.state != leader || rf.PersistentState.CurrentTerm != leaderTerm {
 			justReturn = true
 		}
-		if !justReturn && replies[replyFrom].PeerTerm > rf.persistentState.CurrentTerm {
+		if !justReturn && replies[replyFrom].PeerTerm > rf.PersistentState.CurrentTerm {
 			// Discovered a new term once again.
-			rf.persistentState.VotedFor = -1
+			rf.PersistentState.VotedFor = -1
 			rf.state = follower
-			rf.persistentState.CurrentTerm = replies[replyFrom].PeerTerm
+			rf.PersistentState.CurrentTerm = replies[replyFrom].PeerTerm
 			justReturn = true
 			rf.persist()
 		}
@@ -441,16 +443,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.PeerTerm = rf.persistentState.CurrentTerm
-	if args.LeaderTerm < rf.persistentState.CurrentTerm {
+	reply.PeerTerm = rf.PersistentState.CurrentTerm
+	if args.LeaderTerm < rf.PersistentState.CurrentTerm {
 		// We can't consider this guy the current
 		// leader.
 		return
 	}
 
-	if args.LeaderTerm > rf.persistentState.CurrentTerm {
+	if args.LeaderTerm > rf.PersistentState.CurrentTerm {
 		// We discovered a new term, so reset VotedFor.
-		rf.persistentState.VotedFor = -1
+		rf.PersistentState.VotedFor = -1
 		rf.persist()
 	}
 
@@ -459,7 +461,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// We received an append entry from a node
 		// which has the same or > term number. I think
 		// we should accept this dude as the leader.
-		if args.LeaderTerm >= rf.persistentState.CurrentTerm {
+		if args.LeaderTerm >= rf.PersistentState.CurrentTerm {
 			rf.state = follower
 		}
 	} else if rf.state == leader {
@@ -473,14 +475,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// This is hacky, cause we're basically copying over
 		// the entire log. Don't want to send RPCs one entry
 		// at a time either, so implement a faster method.
-		if args.LeaderTerm > rf.persistentState.CurrentTerm {
+		if args.LeaderTerm > rf.PersistentState.CurrentTerm {
 			rf.state = follower
-		} else if args.LeaderTerm == rf.persistentState.CurrentTerm {
+		} else if args.LeaderTerm == rf.PersistentState.CurrentTerm {
 			fmt.Println("huh", args, rf)
 			panic("Another node send ae to leader with same term.")
 		}
 	}
-	rf.persistentState.CurrentTerm = args.LeaderTerm
+	rf.PersistentState.CurrentTerm = args.LeaderTerm
 	rf.persist()
 	// At this point, we accept a valid leader, so we don't need
 	// to reset the heartbeat.
@@ -501,15 +503,15 @@ func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
 	// that point.
 	for i := 0; i < len(args.Entries); i++ {
 		ii := args.PrevLogIndex + 1 + i
-		if ii < len(rf.persistentState.SnapShot.SnapLog) {
+		if ii < len(rf.PersistentState.SnapShot.SnapLog) {
 			if rf.aLogTerm(ii) != args.Entries[i].AppendTerm {
 				// We're not in sync.
-				rf.persistentState.SnapShot.SnapLog = rf.persistentState.SnapShot.SnapLog[:ii]
-				rf.persistentState.SnapShot.SnapLog = append(rf.persistentState.SnapShot.SnapLog, args.Entries[i])
+				rf.PersistentState.SnapShot.SnapLog = rf.PersistentState.SnapShot.SnapLog[:ii]
+				rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, args.Entries[i])
 			}
 			// There's a match, so the log must be the same.
 		} else {
-			rf.persistentState.SnapShot.SnapLog = append(rf.persistentState.SnapShot.SnapLog, args.Entries[i])
+			rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, args.Entries[i])
 		}
 	}
 	rf.persist()
@@ -538,8 +540,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.PeerTerm = rf.persistentState.CurrentTerm
-	if args.CandidateTerm < rf.persistentState.CurrentTerm {
+	reply.PeerTerm = rf.PersistentState.CurrentTerm
+	if args.CandidateTerm < rf.PersistentState.CurrentTerm {
 		reply.VoteGranted = false
 		return
 	}
@@ -547,22 +549,22 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// A new election implies that old leader could
 	// potentially be useless. We don't want to take requests
 	// from that leader anymore.
-	if args.CandidateTerm > rf.persistentState.CurrentTerm {
+	if args.CandidateTerm > rf.PersistentState.CurrentTerm {
 		// We ran into someone with a higher term.
 		// So, we're guaranteed to accept this as a new term.
 		// So, we reset VotedFor.
 		rf.state = follower
-		rf.persistentState.VotedFor = -1
+		rf.PersistentState.VotedFor = -1
 	}
 
-	rf.persistentState.CurrentTerm = args.CandidateTerm
+	rf.PersistentState.CurrentTerm = args.CandidateTerm
 	rf.persist()
-	notAlreadyVoted := rf.persistentState.VotedFor == -1 || rf.persistentState.VotedFor == args.CandidateID
+	notAlreadyVoted := rf.PersistentState.VotedFor == -1 || rf.PersistentState.VotedFor == args.CandidateID
 	canVote := rf.lastLogTerm() == args.LastLogTerm && rf.lastLogIndex() <= args.LastLogIndex
 	canVote = canVote || rf.lastLogTerm() < args.LastLogTerm
 	reply.VoteGranted = notAlreadyVoted && canVote
 	if reply.VoteGranted {
-		rf.persistentState.VotedFor = args.CandidateID
+		rf.PersistentState.VotedFor = args.CandidateID
 		rf.resetTimer()
 	}
 }
@@ -591,8 +593,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// We kinda just let this be taken to the other nodes
 	// along with a heartbeat. We don't want to do extra shit!
 	// TODO: Might need to send heatbeats from here for speedup.
-	newLog := &RLog{command, rf.persistentState.CurrentTerm}
-	rf.persistentState.SnapShot.SnapLog = append(rf.persistentState.SnapShot.SnapLog, newLog)
+	newLog := &RLog{command, rf.PersistentState.CurrentTerm}
+	rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, newLog)
 	rf.persist()
 
 	// We also keep track of matchIndex for ourselves.
@@ -600,7 +602,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Note that we're using 0 based index, but the client expects
 	// 1 based indexing.
 	go rf.sendHearts()
-	return len(rf.persistentState.SnapShot.SnapLog), rf.persistentState.CurrentTerm, true
+	return len(rf.PersistentState.SnapShot.SnapLog), rf.PersistentState.CurrentTerm, true
 }
 
 func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
@@ -616,7 +618,7 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 			rf.lastApplied++
 			toSend := ApplyMsg{
 				true,
-				rf.persistentState.SnapShot.SnapLog[rf.lastApplied].Command, rf.lastApplied + 1}
+				rf.PersistentState.SnapShot.SnapLog[rf.lastApplied].Command, rf.lastApplied + 1}
 
 			// Again, we need to expose index + 1 for the tests
 			// since it expects 1 based indexing.
@@ -645,7 +647,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 			// We only care for log indices which are greater
 			// than commitIndex.
 			var accumIndices []int
-			for i := 0; i < len(rf.persistentState.SnapShot.SnapLog); i++ {
+			for i := 0; i < len(rf.PersistentState.SnapShot.SnapLog); i++ {
 				indices = append(indices, 0)
 				accumIndices = append(accumIndices, 0)
 			}
@@ -669,7 +671,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 					accumIndices[i] = accumIndices[i+1] + indices[i]
 				}
 				if rf.hasMajority(accumIndices[i]) &&
-					rf.persistentState.SnapShot.SnapLog[i].AppendTerm == rf.persistentState.CurrentTerm {
+					rf.PersistentState.SnapShot.SnapLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
 					// This is the largest index where the leader can be sure that
 					// it exists on all the servers.
 					rf.commitIndex = i
@@ -706,7 +708,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.persistentState.CurrentTerm, (rf.state == leader)
+	return rf.PersistentState.CurrentTerm, (rf.state == leader)
 }
 
 // save Raft's persistent state to stable storage,
@@ -716,11 +718,7 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	// Todo: is it safe to ignore error checking here?
-	e.Encode(rf.persistentState.CurrentTerm)
-	e.Encode(rf.persistentState.VotedFor)
-	e.Encode(rf.persistentState.SnapShot)
-
+	e.Encode(rf.PersistentState)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -736,19 +734,9 @@ func (rf *Raft) readPersist(data []byte) {
 	// will have to decode/encode the byte slice.
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var CurrentTerm int
-	var VotedFor int
-	var SnapShot *SnapShot
-	// todo: Just encode the entire persistent struct.
-
-	// Todo: is it safe to ignore the error checking here.
-	d.Decode(&CurrentTerm)
-	d.Decode(&VotedFor)
-	d.Decode(&SnapShot)
-	rf.persistentState.CurrentTerm = CurrentTerm
-	rf.persistentState.VotedFor = VotedFor
-	// rf.persistentState.SnapShot.SnapLog = Logs
-	rf.persistentState.SnapShot = SnapShot
+	var PersistentState *RaftPersistent
+	d.Decode(&PersistentState)
+	rf.PersistentState = PersistentState
 }
 
 // Make sure that the SnapShot is set.
@@ -758,7 +746,7 @@ func initPersistent(rf *Raft) {
 		LogIndex: -1,
 		Kvs:      make(map[string]string),
 	}
-	rf.persistentState = &RaftPersistent{
+	rf.PersistentState = &RaftPersistent{
 		CurrentTerm: 0,
 		VotedFor:    -1,
 		SnapShot:    snap,

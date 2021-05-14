@@ -209,6 +209,7 @@ func (rf *Raft) indexLog(n int) *RLog {
 }
 
 // Invariant: Acquire lock before calling this.
+// Note: will only return -1, when no logs have been added.
 func (rf *Raft) lastLogIndex() int {
 	return rf.baseIndex() + len(rf.PersistentState.RaftLog) - 1
 }
@@ -227,6 +228,8 @@ func (rf *Raft) aLogTerm(n int) int {
 }
 
 // Invariant: Acquire lock before calling this.
+// Note that this will only return -1 for the case
+// where there have been no logs added.
 func (rf *Raft) lastLogTerm() int {
 	return rf.aLogTerm(rf.lastLogIndex())
 }
@@ -281,10 +284,7 @@ func (rf *Raft) initLeaderState() {
 	rf.matchIndex = make(map[int]int)
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
-
-		// We know for a fact that at least [baseIndex] - 1
-		// must've been applied to the [state].
-		rf.matchIndex[i] = rf.baseIndex() - 1
+		rf.matchIndex[i] = -1
 
 		if i == rf.me {
 			// But we have replicated everything in our own server.

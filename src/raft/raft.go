@@ -90,14 +90,13 @@ type SnapShot struct {
 	LogIndex int // The index applied by the kvs, right before Snapshotting.
 
 	// Kvs is getting persisted on every persist. Might have to hack around that.
-	Kvs     map[string]string // kvs state at the time of the snapshot.
-	SnapLog [](*RLog)         // Logs right after the snapshot.
+	Kvs map[string]string // kvs state at the time of the snapshot.
 }
 
 type RaftPersistent struct {
-	CurrentTerm int // Starts out at 0
-	VotedFor    int // This is just [peers] index. -1 if haven't voted for anyone.
-	SnapShot    *SnapShot
+	CurrentTerm int       // Starts out at 0
+	VotedFor    int       // This is just [peers] index. -1 if haven't voted for anyone.
+	RaftLog     [](*RLog) // Logs right after the snapshot.
 }
 
 // Raft is a single Raft peer.
@@ -107,6 +106,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
+	ch        chan ApplyMsg
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -116,7 +116,8 @@ type Raft struct {
 	commitIndex   int           // Index known by this node to be committed
 	lastApplied   int           // Index for log which was lastApplied by this node.
 
-	PersistentState *RaftPersistent
+	PersistentState *RaftPersistent // raft persistent state.
+	SnapShot        *SnapShot       // raft snapshot
 
 	// This state is only valid for leaders once they
 	// win an election and is only init after they win.
@@ -148,6 +149,16 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
+// Pass in a copy of the snap. The slice specifically should be a copy.
+func (rf *Raft) sendSnapshot(snap *SnapShot) {
+	// Sends the latest snapshot up through append entries.)
+	rf.ch <- ApplyMsg{
+		false,
+		snap,
+		-1,
+	}
+}
+
 // Drop log entries in the truncated log.
 // index is 0 based and referts to position in complete log.
 // Invariant: Acquire lock first.
@@ -172,7 +183,7 @@ func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 // Index must be in-range.
 // Invariant: Acquire lock first
 func (rf *Raft) baseIndex() int {
-	return rf.PersistentState.SnapShot.LogIndex + 1
+	return rf.SnapShot.LogIndex + 1
 }
 
 // Converts an index in the log to an index in the
@@ -185,7 +196,7 @@ func (rf *Raft) indexInLog(n int) int {
 // indices in the complete log, but they are inrange
 // of the truncated log once coverted.
 func (rf *Raft) sliceLog(i, j int) [](*RLog) {
-	return rf.PersistentState.SnapShot.SnapLog[rf.indexInLog(i):rf.indexInLog(j)]
+	return rf.PersistentState.RaftLog[rf.indexInLog(i):rf.indexInLog(j)]
 }
 
 // Get the log entry at the index.
@@ -194,19 +205,23 @@ func (rf *Raft) sliceLog(i, j int) [](*RLog) {
 // Invariant: Acquire lock first.
 func (rf *Raft) indexLog(n int) *RLog {
 	base := rf.baseIndex()
-	return rf.PersistentState.SnapShot.SnapLog[n-base]
+	return rf.PersistentState.RaftLog[n-base]
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) lastLogIndex() int {
-	return rf.baseIndex() + len(rf.PersistentState.SnapShot.SnapLog) - 1
+	return rf.baseIndex() + len(rf.PersistentState.RaftLog) - 1
 }
 
+// TODO: for the following two functions, we need to
+// consider the cases where we might get -1.
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) aLogTerm(n int) int {
 	base := rf.baseIndex()
-	if n < base || n > rf.lastLogIndex() {
+	if n < base-1 || n > rf.lastLogIndex() {
 		return -1
+	} else if n == base-1 {
+		return rf.SnapShot.LogTerm
 	}
 	return rf.indexLog(n).AppendTerm
 }
@@ -267,8 +282,9 @@ func (rf *Raft) initLeaderState() {
 	for i := 0; i < len(rf.peers); i++ {
 		rf.nextIndex[i] = rf.lastLogIndex() + 1
 
-		// Assume nothing is replicated on any server.
-		rf.matchIndex[i] = -1
+		// We know for a fact that at least [baseIndex] - 1
+		// must've been applied to the [state].
+		rf.matchIndex[i] = rf.baseIndex() - 1
 
 		if i == rf.me {
 			// But we have replicated everything in our own server.
@@ -528,12 +544,12 @@ func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
 		if rf.indexInLog(ii) < rf.lastLogIndex()+1 {
 			if rf.aLogTerm(ii) != args.Entries[i].AppendTerm {
 				// We're not in sync.
-				rf.PersistentState.SnapShot.SnapLog = rf.sliceLog(rf.baseIndex(), ii)
-				rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, args.Entries[i])
+				rf.PersistentState.RaftLog = rf.sliceLog(rf.baseIndex(), ii)
+				rf.PersistentState.RaftLog = append(rf.PersistentState.RaftLog, args.Entries[i])
 			}
 			// There's a match, so the log must be the same.
 		} else {
-			rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, args.Entries[i])
+			rf.PersistentState.RaftLog = append(rf.PersistentState.RaftLog, args.Entries[i])
 		}
 	}
 	rf.persist()
@@ -615,7 +631,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// along with a heartbeat. We don't want to do extra shit!
 	// TODO: Might need to send heatbeats from here for speedup.
 	newLog := &RLog{command, rf.PersistentState.CurrentTerm}
-	rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, newLog)
+	rf.PersistentState.RaftLog = append(rf.PersistentState.RaftLog, newLog)
 	rf.persist()
 
 	// We also keep track of matchIndex for ourselves.
@@ -668,7 +684,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 			// We only care for log indices which are greater
 			// than commitIndex.
 			var accumIndices []int
-			for i := 0; i < len(rf.PersistentState.SnapShot.SnapLog); i++ {
+			for i := 0; i < len(rf.PersistentState.RaftLog); i++ {
 				indices = append(indices, 0)
 				accumIndices = append(accumIndices, 0)
 			}
@@ -693,7 +709,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 				}
 				if rf.hasMajority(accumIndices[i]) &&
 					rf.indexLog(i+rf.baseIndex()).AppendTerm == rf.PersistentState.CurrentTerm {
-					// rf.PersistentState.SnapShot.SnapLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
+					// rf.PersistentState.RaftLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
 					// This is the largest index where the leader can be sure that
 					// it exists on all the servers.
 					rf.commitIndex = i + rf.baseIndex()
@@ -733,16 +749,50 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.PersistentState.CurrentTerm, (rf.state == leader)
 }
 
+func (rf *Raft) persistentEncode() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.PersistentState)
+	return w.Bytes()
+}
+
+// Invariant: [data] is non-nil.
+func (rf *Raft) persistentDecode(data []byte) *RaftPersistent {
+	// will have to decode/encode the byte slice.
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var PersistentState *RaftPersistent
+	d.Decode(&PersistentState)
+	return PersistentState
+}
+
+func (rf *Raft) snapEncode() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.SnapShot)
+	return w.Bytes()
+}
+
+func (rf *Raft) snapDecode(data []byte) *SnapShot {
+	// will have to decode/encode the byte slice.
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var SnapShot *SnapShot
+	d.Decode(&SnapShot)
+	return SnapShot
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) persist() {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.PersistentState)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveRaftState(rf.persistentEncode())
+}
+
+// Invariant: Acquire lock.
+func (rf *Raft) persistWithSnap() {
+	rf.persister.SaveStateAndSnapshot(rf.persistentEncode(), rf.snapEncode())
 }
 
 // restore previously persisted state.
@@ -753,34 +803,39 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	// will have to decode/encode the byte slice.
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var PersistentState *RaftPersistent
-	d.Decode(&PersistentState)
-	rf.PersistentState = PersistentState
+	rf.PersistentState = rf.persistentDecode(data)
+}
+
+// We do this before any threads are launched so
+// it's safe to not acquire locks here.
+func (rf *Raft) readSnap(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+	rf.SnapShot = rf.snapDecode(data)
+	fmt.Println(rf.SnapShot)
 }
 
 // Make sure that the SnapShot is set.
 func initPersistent(rf *Raft) {
-	snap := &SnapShot{
+	rf.PersistentState = &RaftPersistent{
+		CurrentTerm: 0,
+		VotedFor:    -1,
+	}
+	rf.SnapShot = &SnapShot{
 		LogTerm:  -1,
 		LogIndex: -1,
 		Kvs:      make(map[string]string),
 	}
-	rf.PersistentState = &RaftPersistent{
-		CurrentTerm: 0,
-		VotedFor:    -1,
-		SnapShot:    snap,
-	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(rf.persister.ReadRaftState())
+	rf.readSnap(rf.persister.ReadSnapshot())
 
 	// Commit index and lastApplied while not persistent,
 	// depend on persistent state.
-	rf.commitIndex = -1
-	rf.lastApplied = -1
+	rf.commitIndex = rf.SnapShot.LogIndex
+	rf.lastApplied = rf.SnapShot.LogIndex
 }
 
 func initNonPersistent(rf *Raft) {
@@ -804,6 +859,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.ch = applyCh
 
 	initNonPersistent(rf)
 	initPersistent(rf)

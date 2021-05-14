@@ -81,6 +81,14 @@ type RLog struct {
 	AppendTerm int // This is the term a log is INITIALLY appended to a leader
 }
 
+// We'll start off with an empty [SnapShot].
+// We need to keep the snapshot and the remaining log in sync.
+type SnapShot struct {
+	LogTerm  int               // Term of log entry at [LogIndex]
+	LogIndex int               // The index applied by the kvs, right before Snapshotting.
+	Kvs      map[string]string // kvs state at the time of the snapshot.
+}
+
 // Raft is a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -106,19 +114,8 @@ type Raft struct {
 	// Except for the leader in which case nextIndex is useless.
 	nextIndex  map[int]int // Index of the next log entry to send to a server.
 	matchIndex map[int]int // Index of the highest log entry known to be replicated on a server.
-}
 
-// Me is used for some whack debugging.
-func (rf *Raft) Me() int {
-	return rf.me
-}
-
-// IsLeader is used to query if node thinks it's the leader.
-// Just for debugging.
-func (rf *Raft) IsLeader() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.state == leader
+	SnapShot *SnapShot
 }
 
 // Basic check to see if current node has majority.
@@ -132,6 +129,41 @@ type RequestVoteArgs struct {
 	CandidateID   int
 	LastLogIndex  int
 	LastLogTerm   int
+}
+
+func (rf *Raft) Me() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.me
+}
+
+// Persists a snapshot to the persister.
+// Invariant: Acquire lock first.
+// [appliedIndex] is 1-based.
+func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+}
+
+// Drop log entries in the truncated log.
+// index is 0 based and referts to position in complete log.
+// Invariant: Acquire lock first.
+func (rf *Raft) dropLog(n int) {
+
+}
+
+// Get the log entry at the index.
+// index is 0 based.
+// Invariant: Acquire lock first.
+func (rf *Raft) indexLog(n int) {
+
+}
+
+// Converts a 0-based index in the overall log
+// to an index in truncated log.
+// Invariant: Acquire lock first.
+func (rf *Raft) indexInLog(n int) {
+
 }
 
 // Invariant: Acquire lock before calling this.

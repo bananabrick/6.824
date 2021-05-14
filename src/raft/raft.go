@@ -639,7 +639,7 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 			rf.lastApplied++
 			toSend := ApplyMsg{
 				true,
-				rf.PersistentState.SnapShot.SnapLog[rf.lastApplied].Command, rf.lastApplied + 1}
+				rf.indexLog(rf.lastApplied).Command, rf.lastApplied + 1}
 
 			// Again, we need to expose index + 1 for the tests
 			// since it expects 1 based indexing.
@@ -678,7 +678,7 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 			// the bounds of the indices array.
 			for i := 0; i < len(rf.matchIndex); i++ {
 				if rf.matchIndex[i] > rf.commitIndex {
-					indices[rf.matchIndex[i]]++
+					indices[rf.indexInLog(rf.matchIndex[i])]++
 				}
 			}
 
@@ -692,10 +692,11 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 					accumIndices[i] = accumIndices[i+1] + indices[i]
 				}
 				if rf.hasMajority(accumIndices[i]) &&
-					rf.PersistentState.SnapShot.SnapLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
+					rf.indexLog(i+rf.baseIndex()).AppendTerm == rf.PersistentState.CurrentTerm {
+					// rf.PersistentState.SnapShot.SnapLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
 					// This is the largest index where the leader can be sure that
 					// it exists on all the servers.
-					rf.commitIndex = i
+					rf.commitIndex = i + rf.baseIndex()
 					break
 				}
 			}

@@ -161,6 +161,10 @@ func (rf *Raft) dropLog(n int) {
 func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// Note if, appliedIndex is behind the current snapshot, then
+	// we can just return. Although, that should never happen.
+	// SnapShots must always proceed forward in time.
 }
 
 // Converts a 0-based index in the overall log
@@ -619,7 +623,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Note that we're using 0 based index, but the client expects
 	// 1 based indexing.
 	go rf.sendHearts()
-	return len(rf.PersistentState.SnapShot.SnapLog), rf.PersistentState.CurrentTerm, true
+	return rf.lastLogIndex() + 1, rf.PersistentState.CurrentTerm, true
 }
 
 func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {

@@ -120,7 +120,10 @@ type Raft struct {
 
 	// This state is only valid for leaders once they
 	// win an election and is only init after they win.
-	// Invariant: nextIndex must always be greater than match index.
+	// Invariant: [nextIndex] must always be greater than match index.
+	// TODO: maintain this invariant.
+	// Invariant: [nextIndex] and [matchIndex] should point within the truncated log.
+	//            [nextIndex] could point one past the last log entry.
 	// Except for the leader in which case nextIndex is useless.
 	nextIndex  map[int]int // Index of the next log entry to send to a server.
 	matchIndex map[int]int // Index of the highest log entry known to be replicated on a server.
@@ -166,6 +169,19 @@ func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 // Invariant: Acquire lock first
 func (rf *Raft) baseIndex() int {
 	return rf.PersistentState.SnapShot.LogIndex + 1
+}
+
+// Converts an index in the log to an index in the
+// truncated log.
+func (rf *Raft) indexInLog(n int) int {
+	return n - rf.baseIndex()
+}
+
+// Slices the log [i, j). i, j are log
+// indices in the complete log, but they are inrange
+// of the truncated log once coverted.
+func (rf *Raft) sliceLog(i, j int) [](*RLog) {
+	return rf.PersistentState.SnapShot.SnapLog[rf.indexInLog(i):rf.indexInLog(j)]
 }
 
 // Get the log entry at the index.
@@ -369,8 +385,8 @@ func (rf *Raft) sendHearts() {
 		prevLogTerm := rf.aLogTerm(prevLogIndex)
 		var entries [](*RLog)
 		if rf.lastLogIndex() >= rf.nextIndex[i] {
-			log := make([]*RLog, len(rf.PersistentState.SnapShot.SnapLog)-rf.nextIndex[i])
-			copy(log, rf.PersistentState.SnapShot.SnapLog[rf.nextIndex[i]:])
+			log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
+			copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
 			entries = log
 		}
 		req := &AppendEntriesArgs{
@@ -505,10 +521,10 @@ func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
 	// that point.
 	for i := 0; i < len(args.Entries); i++ {
 		ii := args.PrevLogIndex + 1 + i
-		if ii < len(rf.PersistentState.SnapShot.SnapLog) {
+		if rf.indexInLog(ii) < rf.lastLogIndex()+1 {
 			if rf.aLogTerm(ii) != args.Entries[i].AppendTerm {
 				// We're not in sync.
-				rf.PersistentState.SnapShot.SnapLog = rf.PersistentState.SnapShot.SnapLog[:ii]
+				rf.PersistentState.SnapShot.SnapLog = rf.sliceLog(rf.baseIndex(), ii)
 				rf.PersistentState.SnapShot.SnapLog = append(rf.PersistentState.SnapShot.SnapLog, args.Entries[i])
 			}
 			// There's a match, so the log must be the same.
@@ -583,7 +599,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()

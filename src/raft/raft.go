@@ -145,6 +145,13 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
+// Drop log entries in the truncated log.
+// index is 0 based and referts to position in complete log.
+// Invariant: Acquire lock first.
+func (rf *Raft) dropLog(n int) {
+
+}
+
 // Persists a snapshot to the persister.
 // Invariant: Acquire lock first.
 // [appliedIndex] is 1-based.
@@ -153,11 +160,12 @@ func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 	defer rf.mu.Unlock()
 }
 
-// Drop log entries in the truncated log.
-// index is 0 based and referts to position in complete log.
-// Invariant: Acquire lock first.
-func (rf *Raft) dropLog(n int) {
-
+// Converts a 0-based index in the overall log
+// to an index in truncated log.
+// Index must be in-range.
+// Invariant: Acquire lock first
+func (rf *Raft) baseIndex() int {
+	return rf.PersistentState.SnapShot.LogIndex + 1
 }
 
 // Get the log entry at the index.
@@ -165,33 +173,27 @@ func (rf *Raft) dropLog(n int) {
 // index must be in-range.
 // Invariant: Acquire lock first.
 func (rf *Raft) indexLog(n int) *RLog {
-	return rf.PersistentState.SnapShot.SnapLog[n]
-}
-
-// Converts a 0-based index in the overall log
-// to an index in truncated log.
-// Index must be in-range.
-// Invariant: Acquire lock first.
-func (rf *Raft) indexInLog(n int) {
-
+	base := rf.baseIndex()
+	return rf.PersistentState.SnapShot.SnapLog[n-base]
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) lastLogIndex() int {
-	return len(rf.PersistentState.SnapShot.SnapLog) - 1
+	return rf.baseIndex() + len(rf.PersistentState.SnapShot.SnapLog) - 1
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) aLogTerm(n int) int {
-	if n < 0 || n >= len(rf.PersistentState.SnapShot.SnapLog) {
+	base := rf.baseIndex()
+	if n < base || n > rf.lastLogIndex() {
 		return -1
 	}
-	return rf.PersistentState.SnapShot.SnapLog[n].AppendTerm
+	return rf.indexLog(n).AppendTerm
 }
 
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) lastLogTerm() int {
-	return rf.aLogTerm(len(rf.PersistentState.SnapShot.SnapLog) - 1)
+	return rf.aLogTerm(rf.lastLogIndex())
 }
 
 // RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.

@@ -181,7 +181,8 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
-// Invariant: The slice and the kvs passed should have no other references.
+// Invariant: The slice and the kvs passed should have no other references
+// which can be modified.
 func (rf *Raft) sendSnapshot(ch chan bool, snap *SnapShot, logs [](*RLog)) {
 	// Sends the latest snapshot up through append entries.
 	rf.ch <- ApplyMsg{
@@ -194,30 +195,72 @@ func (rf *Raft) sendSnapshot(ch chan bool, snap *SnapShot, logs [](*RLog)) {
 }
 
 // Returns [true] if the kvserver should equip the log.
-// Invariant: The slice and kvs passed in should have no other references.
-func (rf *Raft) InstallLog(msg ApplyMsg) bool {
+// Invariant: The slice and kvs passed in should have no other references which
+// will be modified.
+func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return false
+	snap := msg.Command.(*SnapShot)
+
+	if snap.LogIndex <= rf.SnapShot.LogIndex {
+		// We've already installed this snapshot.
+		return false
+	}
+	rf.SnapShot = &SnapShot{
+		snap.LogTerm,
+		snap.LogIndex,
+		snap.Kvs,
+	}
+	rf.PersistentState.RaftLog = msg.Logs
+	rf.lastApplied = snap.LogIndex
+	rf.commitIndex = snap.LogIndex
+	rf.persistWithSnap()
+
+	defer func() {
+		// Allow some other thread to reply success to the leader.
+		msg.processedCh <- true
+	}()
+
+	return true
 }
 
-// Drop log entries in the truncated log.
-// index is 0 based and referts to position in complete log.
-// Invariant: Acquire lock first.
-func (rf *Raft) dropLog(n int) {
-
-}
-
-// Persists a snapshot to the persister.
+// Atomically takes a snap, modifies log and persists a snapshot to the persister.
+// This function will copy the map, so it doesn't need to be copied by caller.
 // Invariant: Acquire lock first.
 // [appliedIndex] is 1-based.
 func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// Covert to 0-based indexing.
+	appliedIndex--
+
 	// Note if, appliedIndex is behind the current snapshot, then
 	// we can just return. Although, that should never happen.
 	// SnapShots must always proceed forward in time.
+	if rf.SnapShot.LogIndex >= appliedIndex {
+		panic("New Snapshot position is not increasing.")
+	}
+
+	if rf.lastLogIndex() < appliedIndex {
+		// We don't have the log entry to get the term.
+		// But that log entry must've been committed and at one
+		// point and we must've had it.
+		// We've already applied beyond our log.
+		// This shouldn't happen.
+		// We should never lose committed entries.
+		// So, this isn't possible.
+		panic("We don't have this log entry. So, we can't snapshot.")
+	}
+
+	// [appliedIndex] is in range of the truncated log.
+	rf.SnapShot = &SnapShot{
+		rf.indexLog(appliedIndex).AppendTerm,
+		appliedIndex,
+		copyMap(kvs),
+	}
+	rf.PersistentState.RaftLog = rf.sliceLog(appliedIndex, rf.lastLogIndex()+1)
+	rf.persistWithSnap()
 }
 
 // Converts a 0-based index in the overall log
@@ -573,11 +616,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// At this point, we accept a valid leader, so we need
 	// to reset the timer.
 	if args.SnapShot != nil {
-		panic("this shouldn't happen")
-
 		installCh := make(chan bool)
 		go rf.sendSnapshot(installCh, args.SnapShot, args.Entries)
-
 		// At this point we either took over the snapshot or not.
 		reply.Success = <-installCh
 	} else {

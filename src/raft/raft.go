@@ -113,8 +113,11 @@ type Raft struct {
 	state         int           // Starts out as follower
 	lastContact   time.Time     // Don't need to sync time for these labs.
 	timerDuration time.Duration // Keeps track of how long the current election timer is.
-	commitIndex   int           // Index known by this node to be committed
-	lastApplied   int           // Index for log which was lastApplied by this node.
+
+	// Invariant: [commitIndex] and [lastApplied] are within the nodes truncated log including
+	// the snapshot [LogIndex].
+	commitIndex int // Index known by this node to be committed
+	lastApplied int // Index for log which was lastApplied by this node.
 
 	PersistentState *RaftPersistent // raft persistent state.
 	SnapShot        *SnapShot       // raft snapshot
@@ -123,16 +126,8 @@ type Raft struct {
 	// win an election and is only init after they win.
 	// Invariant: [nextIndex] must always be greater than match index.
 	// TODO: maintain this invariant.
-	// Invariant: [nextIndex] and [matchIndex] should point within the truncated log.
-	//            [nextIndex] could point one past the last log entry.
-	// Except for the leader in which case nextIndex is useless.
 	nextIndex  map[int]int // Index of the next log entry to send to a server.
 	matchIndex map[int]int // Index of the highest log entry known to be replicated on a server.
-}
-
-// Basic check to see if current node has majority.
-func (rf *Raft) hasMajority(n int) bool {
-	return 2*n > len(rf.peers)
 }
 
 // RequestVoteArgs is send to the peer we send [RequestVote] RPC to.
@@ -141,6 +136,39 @@ type RequestVoteArgs struct {
 	CandidateID   int
 	LastLogIndex  int
 	LastLogTerm   int
+}
+
+// RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
+type RequestVoteReply struct {
+	PeerTerm    int  // This is the term of the peer which candidate sent [RequestVote] to.
+	VoteGranted bool // Whether the peer voted for the candidate.
+}
+
+// AppendEntriesArgs is sent to the peer in the
+// [AppendEntries] RPC to.
+// Note that only the leader should send these out.
+// However, there are cases when previous leaders could
+// potentially send these out. In that case, we reject
+// the leader.
+type AppendEntriesArgs struct {
+	LeaderTerm        int
+	LeaderID          int
+	PrevLogIndex      int
+	PrevLogTerm       int
+	Entries           [](*RLog)
+	LeaderCommitIndex int
+}
+
+// AppendEntriesReply returns some data
+// from the peer we sent an [AppendEntries] RPC to.
+type AppendEntriesReply struct {
+	PeerTerm int
+	Success  bool
+}
+
+// Basic check to see if current node has majority.
+func (rf *Raft) hasMajority(n int) bool {
+	return 2*n > len(rf.peers)
 }
 
 func (rf *Raft) Me() int {
@@ -232,34 +260,6 @@ func (rf *Raft) aLogTerm(n int) int {
 // where there have been no logs added.
 func (rf *Raft) lastLogTerm() int {
 	return rf.aLogTerm(rf.lastLogIndex())
-}
-
-// RequestVoteReply is filled in by the peer which we send [RequestVote] RPC to.
-type RequestVoteReply struct {
-	PeerTerm    int  // This is the term of the peer which candidate sent [RequestVote] to.
-	VoteGranted bool // Whether the peer voted for the candidate.
-}
-
-// AppendEntriesArgs is sent to the peer in the
-// [AppendEntries] RPC to.
-// Note that only the leader should send these out.
-// However, there are cases when previous leaders could
-// potentially send these out. In that case, we reject
-// the leader.
-type AppendEntriesArgs struct {
-	LeaderTerm        int
-	LeaderID          int
-	PrevLogIndex      int
-	PrevLogTerm       int
-	Entries           [](*RLog)
-	LeaderCommitIndex int
-}
-
-// AppendEntriesReply returns some data
-// from the peer we sent an [AppendEntries] RPC to.
-type AppendEntriesReply struct {
-	PeerTerm int
-	Success  bool
 }
 
 // Checks periodically if timer has expired.
@@ -694,6 +694,8 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 			// the bounds of the indices array.
 			for i := 0; i < len(rf.matchIndex); i++ {
 				if rf.matchIndex[i] > rf.commitIndex {
+					// TODO: matchIndex is not necessarily in range of
+					// the leaders log.
 					indices[rf.indexInLog(rf.matchIndex[i])]++
 				}
 			}

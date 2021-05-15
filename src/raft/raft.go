@@ -92,7 +92,8 @@ type SnapShot struct {
 	LogIndex int // The index applied by the kvs, right before Snapshotting.
 
 	// Kvs is getting persisted on every persist. Might have to hack around that.
-	Kvs map[string]string // kvs state at the time of the snapshot.
+	Kvs        map[string]string // kvs state at the time of the snapshot.
+	KVEncoding []byte
 }
 
 type RaftPersistent struct {
@@ -893,6 +894,10 @@ func (rf *Raft) snapDecode(data []byte) *SnapShot {
 	return SnapShot
 }
 
+func (rf *Raft) LoadSnapshot() *SnapShot {
+	return rf.readSnap(rf.persister.ReadSnapshot())
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -909,7 +914,7 @@ func (rf *Raft) persistWithSnap() {
 // restore previously persisted state.
 // We do this before any threads are launched so
 // it's safe to not acquire locks here.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) setPersistent(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -917,14 +922,20 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.PersistentState = rf.persistentDecode(data)
 }
 
+func (rf *Raft) readSnap(data []byte) *SnapShot {
+	if data == nil || len(data) < 1 {
+		return nil
+	}
+	return rf.snapDecode(data)
+}
+
 // We do this before any threads are launched so
 // it's safe to not acquire locks here.
-func (rf *Raft) readSnap(data []byte) {
+func (rf *Raft) setSnap(data []byte) {
 	if data == nil || len(data) < 1 {
 		return
 	}
 	rf.SnapShot = rf.snapDecode(data)
-	fmt.Println(rf.SnapShot)
 }
 
 // Make sure that the SnapShot is set.
@@ -940,12 +951,12 @@ func initPersistent(rf *Raft) {
 	}
 
 	// initialize from state persisted before a crash
-	rf.readPersist(rf.persister.ReadRaftState())
+	rf.setPersistent(rf.persister.ReadRaftState())
 
 	// TODO: We're loading the snapshot here, but we need to make sure
 	// that the kvserver has already installed the snapshot, before processing
 	// any commands.
-	rf.readSnap(rf.persister.ReadSnapshot())
+	rf.setSnap(rf.persister.ReadSnapshot())
 
 	// Commit index and lastApplied while not persistent,
 	// depend on persistent state.

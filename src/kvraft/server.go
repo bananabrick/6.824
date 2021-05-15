@@ -48,7 +48,8 @@ type KVServer struct {
 	maxraftstate int   // snapshot if log grows this big
 
 	// This is the core key-value store state.
-	kvs map[string]string
+	kvs           map[string]string
+	lastProcessed int // 1-based command in the log which has been processed or/and applied.
 
 	// If a commit is in here, then we know that we've started agreement, but not
 	// yet processed a reply that SOMETHING got committed at the expected index.
@@ -87,6 +88,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.kvs = make(map[string]string)
+	kv.lastProcessed = 0 // haven't processed any.
+	snap := kv.rf.LoadSnapshot()
+	if snap != nil {
+		// We have to load from a checkpoint, before we process any incoming messages.
+		kv.kvs = snap.Kvs
+		kv.lastProcessed = snap.LogIndex + 1
+
+		// TODO: we also need to add other stuff to snapshot.
+	}
 	kv.pendingCommits = make(map[int]*pendingCommit)
 	kv.sequenceApplied = make(map[clientIDT]int)
 
@@ -106,6 +116,8 @@ func (kv *KVServer) readFromApplyCh() {
 		if kv.killed() {
 			return
 		}
+
+		// TODO: try to install snapshots, and ignore commands <= lastApplied to the kvserver.
 
 		// This isn't a datarace since applyCh var is only ever
 		// read from.

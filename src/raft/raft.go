@@ -125,7 +125,8 @@ type Raft struct {
 	// This state is only valid for leaders once they
 	// win an election and is only init after they win.
 	// Invariant: [nextIndex] must always be greater than match index.
-	// TODO: maintain this invariant.
+	// TODO: [matchIndex], [nextIndex] can be out of range. So, we need to make sure that
+	// using them to access the log, doesn't result in an error.
 	nextIndex  map[int]int // Index of the next log entry to send to a server.
 	matchIndex map[int]int // Index of the highest log entry known to be replicated on a server.
 }
@@ -532,6 +533,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // Note that the leader does have the authority to do whatever it wants with our
 // logs.
 func (rf *Raft) updateAfterHearbeat(args *AppendEntriesArgs) bool {
+	if args.PrevLogIndex < rf.SnapShot.LogIndex || args.PrevLogIndex > rf.lastLogIndex() {
+		// We've truncated the log so we can't compare terms.
+		return false
+	}
+
+	// At this point, we know that [args.PrevLogIndex] is within
+	// the truncated log.
 	if rf.aLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
 		// No match.
 		return false
@@ -652,6 +660,8 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 
 		rf.mu.Lock()
 		for rf.lastApplied < rf.commitIndex {
+			// Once incremented, [lastApplied] should be within truncated log,
+			// acc to the invariants.
 			rf.lastApplied++
 			toSend := ApplyMsg{
 				true,
@@ -689,13 +699,12 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 				accumIndices = append(accumIndices, 0)
 			}
 
-			// matchIndex is either -1, or it points to
-			// an item in the log. So, it should fit within
-			// the bounds of the indices array.
+			// matchIndex[i] might not be within the truncated log.
+			// It can't be greater than the last log index however.
 			for i := 0; i < len(rf.matchIndex); i++ {
+				// If [matchIndex[i]] is > [commitIndex], and we know that
+				// the [matchIndex[i]] is within the log.
 				if rf.matchIndex[i] > rf.commitIndex {
-					// TODO: matchIndex is not necessarily in range of
-					// the leaders log.
 					indices[rf.indexInLog(rf.matchIndex[i])]++
 				}
 			}
@@ -711,7 +720,6 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 				}
 				if rf.hasMajority(accumIndices[i]) &&
 					rf.indexLog(i+rf.baseIndex()).AppendTerm == rf.PersistentState.CurrentTerm {
-					// rf.PersistentState.RaftLog[i].AppendTerm == rf.PersistentState.CurrentTerm {
 					// This is the largest index where the leader can be sure that
 					// it exists on all the servers.
 					rf.commitIndex = i + rf.baseIndex()
@@ -832,6 +840,10 @@ func initPersistent(rf *Raft) {
 
 	// initialize from state persisted before a crash
 	rf.readPersist(rf.persister.ReadRaftState())
+
+	// TODO: We're loading the snapshot here, but we need to make sure
+	// that the kvserver has already installed the snapshot, before processing
+	// any commands.
 	rf.readSnap(rf.persister.ReadSnapshot())
 
 	// Commit index and lastApplied while not persistent,

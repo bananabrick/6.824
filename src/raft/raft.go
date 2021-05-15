@@ -158,6 +158,7 @@ type AppendEntriesArgs struct {
 	PrevLogTerm       int
 	Entries           [](*RLog)
 	LeaderCommitIndex int
+	OverWrite         bool
 }
 
 // AppendEntriesReply returns some data
@@ -386,6 +387,13 @@ func (rf *Raft) sendAppendEntries() {
 	}
 }
 
+// Returns the appendEntry structs to send to the peer.
+// Invariant: acquire lock before calling
+func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesReply) {
+	
+}
+
+// TODO: fix this
 func (rf *Raft) sendHearts() {
 	rf.mu.Lock()
 	if rf.state != leader {
@@ -402,17 +410,27 @@ func (rf *Raft) sendHearts() {
 		if i == rf.me {
 			continue
 		}
+
 		prevLogIndex := rf.nextIndex[i] - 1
-		prevLogTerm := rf.aLogTerm(prevLogIndex)
-		var entries [](*RLog)
-		if rf.lastLogIndex() >= rf.nextIndex[i] {
-			log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
-			copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
-			entries = log
-		}
-		req := &AppendEntriesArgs{
-			rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex}
+		var 
+		var req *AppendEntriesArgs
 		rep := &AppendEntriesReply{}
+		if prevLogIndex < rf.SnapShot.LogIndex {
+			// We don't have this entry to synchronize with follower anymore.
+			// So, we just send them an entire snapshot.
+
+		} else {
+			prevLogTerm := rf.aLogTerm(prevLogIndex)
+			var entries [](*RLog)
+			if rf.lastLogIndex() >= rf.nextIndex[i] {
+				log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
+				copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
+				entries = log
+			}
+			req = &AppendEntriesArgs{
+				rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex, false}
+		}
+
 		replies[i] = rep
 		allArgs[i] = req
 		go rf.sendEntries(ch, i, req, rep)

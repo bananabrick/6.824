@@ -59,6 +59,8 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Logs         [](*RLog)
+	processedCh  chan bool
 }
 
 const (
@@ -158,7 +160,7 @@ type AppendEntriesArgs struct {
 	PrevLogTerm       int
 	Entries           [](*RLog)
 	LeaderCommitIndex int
-	OverWrite         bool
+	SnapShot          *SnapShot
 }
 
 // AppendEntriesReply returns some data
@@ -179,14 +181,24 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
-// Pass in a copy of the snap. The slice specifically should be a copy.
-func (rf *Raft) sendSnapshot(snap *SnapShot) {
-	// Sends the latest snapshot up through append entries.)
+// Invariant: The slice and the kvs passed should have no other references.
+func (rf *Raft) sendSnapshot(ch chan bool, snap *SnapShot, logs [](*RLog)) {
+	// Sends the latest snapshot up through append entries.
 	rf.ch <- ApplyMsg{
 		false,
 		snap,
 		-1,
+		logs,
+		ch,
 	}
+}
+
+// Returns [true] if the kvserver should equip the log.
+// Invariant: The slice and kvs passed in should have no other references.
+func (rf *Raft) InstallLog(msg ApplyMsg) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return false
 }
 
 // Drop log entries in the truncated log.
@@ -387,10 +399,47 @@ func (rf *Raft) sendAppendEntries() {
 	}
 }
 
+func copyMap(mm map[string]string) map[string]string {
+	nm := make(map[string]string)
+	for k, v := range nm {
+		nm[k] = v
+	}
+	return nm
+}
+
 // Returns the appendEntry structs to send to the peer.
 // Invariant: acquire lock before calling
 func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesReply) {
-	
+	prevLogIndex := rf.nextIndex[i] - 1
+	var prevLogTerm int
+	var req *AppendEntriesArgs
+	rep := &AppendEntriesReply{}
+	if prevLogIndex < rf.SnapShot.LogIndex {
+		prevLogTerm = rf.SnapShot.LogTerm
+		prevLogIndex = rf.SnapShot.LogIndex
+		snap := &SnapShot{
+			LogTerm:  prevLogTerm,
+			LogIndex: prevLogIndex,
+			Kvs:      copyMap(rf.SnapShot.Kvs),
+		}
+		var entries [](*RLog)
+		log := make([]*RLog, len(rf.PersistentState.RaftLog))
+		copy(log, rf.PersistentState.RaftLog)
+		entries = log
+		req = &AppendEntriesArgs{
+			rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex, snap}
+	} else {
+		prevLogTerm = rf.aLogTerm(prevLogIndex)
+		var entries [](*RLog)
+		if rf.lastLogIndex() >= rf.nextIndex[i] {
+			log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
+			copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
+			entries = log
+		}
+		req = &AppendEntriesArgs{
+			rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex, nil}
+	}
+	return req, rep
 }
 
 // TODO: fix this
@@ -410,27 +459,7 @@ func (rf *Raft) sendHearts() {
 		if i == rf.me {
 			continue
 		}
-
-		prevLogIndex := rf.nextIndex[i] - 1
-		var 
-		var req *AppendEntriesArgs
-		rep := &AppendEntriesReply{}
-		if prevLogIndex < rf.SnapShot.LogIndex {
-			// We don't have this entry to synchronize with follower anymore.
-			// So, we just send them an entire snapshot.
-
-		} else {
-			prevLogTerm := rf.aLogTerm(prevLogIndex)
-			var entries [](*RLog)
-			if rf.lastLogIndex() >= rf.nextIndex[i] {
-				log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
-				copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
-				entries = log
-			}
-			req = &AppendEntriesArgs{
-				rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex, false}
-		}
-
+		req, rep := rf.appendEntryStruct(i)
 		replies[i] = rep
 		allArgs[i] = req
 		go rf.sendEntries(ch, i, req, rep)
@@ -541,9 +570,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.PersistentState.CurrentTerm = args.LeaderTerm
 	rf.persist()
-	// At this point, we accept a valid leader, so we don't need
-	// to reset the heartbeat.
-	reply.Success = rf.updateAfterHearbeat(args)
+	// At this point, we accept a valid leader, so we need
+	// to reset the timer.
+	if args.SnapShot != nil {
+		panic("this shouldn't happen")
+
+		installCh := make(chan bool)
+		go rf.sendSnapshot(installCh, args.SnapShot, args.Entries)
+
+		// At this point we either took over the snapshot or not.
+		reply.Success = <-installCh
+	} else {
+		reply.Success = rf.updateAfterHearbeat(args)
+	}
 	rf.resetTimer()
 }
 
@@ -683,7 +722,11 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 			rf.lastApplied++
 			toSend := ApplyMsg{
 				true,
-				rf.indexLog(rf.lastApplied).Command, rf.lastApplied + 1}
+				rf.indexLog(rf.lastApplied).Command,
+				rf.lastApplied + 1,
+				nil,
+				nil,
+			}
 
 			// Again, we need to expose index + 1 for the tests
 			// since it expects 1 based indexing.

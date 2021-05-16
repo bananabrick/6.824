@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"crypto/rand"
+	"fmt"
 	"math/big"
 	"time"
 
@@ -67,7 +68,7 @@ func (ck *Clerk) setNewLeader() {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	nextSeqNum := ck.nextSeqNum()
-	args := &GetArgs{
+	args := GetArgs{
 		Key:         key,
 		ClientID:    ck.clientID,
 		SequenceNum: nextSeqNum,
@@ -75,17 +76,17 @@ func (ck *Clerk) Get(key string) string {
 		// we've seen the response to the previous request.
 		SeenSeqUntil: nextSeqNum - 1,
 	}
-	reply := &GetReply{}
+	reply := GetReply{}
 	for {
-		var ok bool
 		dprintln("client sending get to", ck.currLeader, ck.clientID, nextSeqNum)
-		ok = ck.makeRPCWithTimeout("KVServer.Get", args, reply, 200)
+		ok, rep := ck.makeRPCWithTimeoutGet(ck.currLeader, "KVServer.Get", args, reply, 200)
+		fmt.Println("client_g", ok, args, rep, ck.currLeader)
 		if ok {
 			// Request went through.
-			if reply.Err == OK {
+			if rep.Err == OK {
 				ck.seenResponse = max(ck.seenResponse, args.SequenceNum)
-				return reply.Value
-			} else if reply.Err == ErrNoKey {
+				return rep.Value
+			} else if rep.Err == ErrNoKey {
 				ck.seenResponse = max(ck.seenResponse, args.SequenceNum)
 				return ""
 			}
@@ -94,6 +95,23 @@ func (ck *Clerk) Get(key string) string {
 		// If we're here, then the previous request didn't work for some reason.
 		// Try a new leader.
 		ck.setNewLeader()
+	}
+}
+
+func (ck *Clerk) makeRPCWithTimeoutGet(leader int, name string, args GetArgs, reply GetReply, timeout int) (bool, *GetReply) {
+	waitCh := make(chan bool)
+	go func() {
+		var ok bool
+		ok = ck.servers[leader].Call(name, &args, &reply)
+		waitCh <- ok
+	}()
+
+	var ok bool
+	select {
+	case ok = <-waitCh:
+		return ok, &reply
+	case <-time.After(time.Millisecond * time.Duration(timeout)):
+		return false, nil
 	}
 }
 
@@ -109,7 +127,7 @@ func (ck *Clerk) Get(key string) string {
 // of the request completing successfully.
 func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 	nextSeqNum := ck.nextSeqNum()
-	args := &PutAppendArgs{
+	args := PutAppendArgs{
 		Key:         key,
 		Value:       value,
 		Op:          op,
@@ -119,12 +137,12 @@ func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 		// we've seen the response to the previous request.
 		SeenSeqUntil: nextSeqNum - 1,
 	}
-	reply := &PutAppendReply{}
+	reply := PutAppendReply{}
 	for {
-		var ok bool
 		dprintln("client sending update to", ck.currLeader, ck.clientID, nextSeqNum)
-		ok = ck.makeRPCWithTimeout("KVServer.PutAppend", args, reply, 200)
-		if ok && reply.Err == OK {
+		ok, rep := ck.makeRPCWithTimeoutPut(ck.currLeader, "KVServer.PutAppend", args, reply, 200)
+		fmt.Println("client_p", ok, args, rep, ck.currLeader)
+		if ok && rep.Err == OK {
 			// Request went through.
 			ck.seenResponse = max(ck.seenResponse, args.SequenceNum)
 			return
@@ -135,19 +153,20 @@ func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 	}
 }
 
-func (ck *Clerk) makeRPCWithTimeout(name string, args interface{}, reply interface{}, timeout int) bool {
+func (ck *Clerk) makeRPCWithTimeoutPut(leader int, name string, args PutAppendArgs, reply PutAppendReply, timeout int) (bool, *PutAppendReply) {
 	waitCh := make(chan bool)
 	go func() {
-		ok := ck.servers[ck.currLeader].Call(name, args, reply)
+		var ok bool
+		ok = ck.servers[leader].Call(name, &args, &reply)
 		waitCh <- ok
 	}()
 
 	var ok bool
 	select {
 	case ok = <-waitCh:
-		return ok
+		return ok, &reply
 	case <-time.After(time.Millisecond * time.Duration(timeout)):
-		return false
+		return false, nil
 	}
 }
 

@@ -60,7 +60,6 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	Logs         [](*RLog)
-	processedCh  chan bool
 }
 
 const (
@@ -109,7 +108,7 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
-	ch        chan ApplyMsg
+	applyCh   chan ApplyMsg
 
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -182,17 +181,23 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
+func (rf *Raft) Leader() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.state == leader
+}
+
 // Invariant: The slice and the kvs passed should have no other references
 // which can be modified.
-func (rf *Raft) sendSnapshot(ch chan bool, snap *SnapShot, logs [](*RLog)) {
+func (rf *Raft) sendSnapshot(snap *SnapShot, logs [](*RLog)) {
 	// Sends the latest snapshot up through append entries.
-	rf.ch <- ApplyMsg{
+	rf.applyCh <- ApplyMsg{
 		false,
 		snap,
 		-1,
 		logs,
-		ch,
 	}
+	fmt.Println("snapshot sent to kvserver", rf.me)
 }
 
 // Returns [true] if the kvserver should equip the log.
@@ -201,10 +206,14 @@ func (rf *Raft) sendSnapshot(ch chan bool, snap *SnapShot, logs [](*RLog)) {
 func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	fmt.Println("raft maybe install snapshot", rf.me, msg)
 	snap := msg.Command.(*SnapShot)
 
 	if snap.LogIndex <= rf.SnapShot.LogIndex {
 		// We've already installed this snapshot.
+		defer func() {
+			fmt.Println("raft snapshot installation terminated", rf.me, msg, snap.LogIndex, rf.SnapShot.LogIndex)
+		}()
 		return false
 	}
 	rf.SnapShot = &SnapShot{
@@ -219,7 +228,7 @@ func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 
 	defer func() {
 		// Allow some other thread to reply success to the leader.
-		msg.processedCh <- true
+		fmt.Println("raft snapshot installation successful", rf.me, msg)
 	}()
 
 	return true
@@ -230,6 +239,14 @@ func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 // Invariant: Acquire lock first.
 // [appliedIndex] is 1-based.
 func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
+	fmt.Println("raft begin taking snapshot", rf.Me())
+	defer func() {
+		fmt.Println("raft end taking snapshot", rf.Me())
+	}()
+	if appliedIndex == 0 {
+		return
+	}
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -240,7 +257,9 @@ func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
 	// we can just return. Although, that should never happen.
 	// SnapShots must always proceed forward in time.
 	if rf.SnapShot.LogIndex >= appliedIndex {
-		panic("New Snapshot position is not increasing.")
+		// fmt.Println(rf.SnapShot.LogIndex, appliedIndex)
+		// panic("New Snapshot position is not increasing.")
+		return
 	}
 
 	if rf.lastLogIndex() < appliedIndex {
@@ -251,16 +270,17 @@ func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
 		// This shouldn't happen.
 		// We should never lose committed entries.
 		// So, this isn't possible.
-		panic("We don't have this log entry. So, we can't snapshot.")
+		return
 	}
 
+	newSnapTerm := rf.indexLog(appliedIndex).AppendTerm
+	rf.PersistentState.RaftLog = rf.sliceLog(appliedIndex+1, rf.lastLogIndex()+1)
 	// [appliedIndex] is in range of the truncated log.
 	rf.SnapShot = &SnapShot{
-		rf.indexLog(appliedIndex).AppendTerm,
+		newSnapTerm,
 		appliedIndex,
 		kvEncoding,
 	}
-	rf.PersistentState.RaftLog = rf.sliceLog(appliedIndex, rf.lastLogIndex()+1)
 	rf.persistWithSnap()
 }
 
@@ -443,14 +463,6 @@ func (rf *Raft) sendAppendEntries() {
 	}
 }
 
-func copyMap(mm map[string]string) map[string]string {
-	nm := make(map[string]string)
-	for k, v := range nm {
-		nm[k] = v
-	}
-	return nm
-}
-
 // Returns the appendEntry structs to send to the peer.
 // Invariant: acquire lock before calling
 func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesReply) {
@@ -617,10 +629,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// At this point, we accept a valid leader, so we need
 	// to reset the timer.
 	if args.SnapShot != nil {
-		installCh := make(chan bool)
-		go rf.sendSnapshot(installCh, args.SnapShot, args.Entries)
+		fmt.Println("received a snapshot", rf.me)
+		go rf.sendSnapshot(args.SnapShot, args.Entries)
 		// At this point we either took over the snapshot or not.
-		reply.Success = <-installCh
+		// We're deadlocking by waiting here.
+		// reply.Success = <-installCh
+		// fmt.Println("snapshot install reply", rf.me, installCh, reply.Success)
+		reply.Success = true
 	} else {
 		reply.Success = rf.updateAfterHearbeat(args)
 	}
@@ -765,7 +780,6 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 				true,
 				rf.indexLog(rf.lastApplied).Command,
 				rf.lastApplied + 1,
-				nil,
 				nil,
 			}
 
@@ -985,7 +999,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.ch = applyCh
+	rf.applyCh = applyCh
 
 	initNonPersistent(rf)
 	initPersistent(rf)

@@ -92,7 +92,7 @@ type SnapShot struct {
 	LogIndex int // The index applied by the kvs, right before Snapshotting.
 
 	// Kvs is getting persisted on every persist. Might have to hack around that.
-	Kvs        map[string]string // kvs state at the time of the snapshot.
+	// Kvs        map[string]string // kvs state at the time of the snapshot.
 	KVEncoding []byte
 }
 
@@ -210,7 +210,7 @@ func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 	rf.SnapShot = &SnapShot{
 		snap.LogTerm,
 		snap.LogIndex,
-		snap.Kvs,
+		snap.KVEncoding,
 	}
 	rf.PersistentState.RaftLog = msg.Logs
 	rf.lastApplied = snap.LogIndex
@@ -229,7 +229,7 @@ func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 // This function will copy the map, so it doesn't need to be copied by caller.
 // Invariant: Acquire lock first.
 // [appliedIndex] is 1-based.
-func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
+func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -258,7 +258,7 @@ func (rf *Raft) TakeSnapShot(kvs map[string]string, appliedIndex int) {
 	rf.SnapShot = &SnapShot{
 		rf.indexLog(appliedIndex).AppendTerm,
 		appliedIndex,
-		copyMap(kvs),
+		kvEncoding,
 	}
 	rf.PersistentState.RaftLog = rf.sliceLog(appliedIndex, rf.lastLogIndex()+1)
 	rf.persistWithSnap()
@@ -462,9 +462,9 @@ func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesRepl
 		prevLogTerm = rf.SnapShot.LogTerm
 		prevLogIndex = rf.SnapShot.LogIndex
 		snap := &SnapShot{
-			LogTerm:  prevLogTerm,
-			LogIndex: prevLogIndex,
-			Kvs:      copyMap(rf.SnapShot.Kvs),
+			LogTerm:    prevLogTerm,
+			LogIndex:   prevLogIndex,
+			KVEncoding: rf.SnapShot.KVEncoding,
 		}
 		var entries [](*RLog)
 		log := make([]*RLog, len(rf.PersistentState.RaftLog))
@@ -945,9 +945,9 @@ func initPersistent(rf *Raft) {
 		VotedFor:    -1,
 	}
 	rf.SnapShot = &SnapShot{
-		LogTerm:  -1,
-		LogIndex: -1,
-		Kvs:      make(map[string]string),
+		LogTerm:    -1,
+		LogIndex:   -1,
+		KVEncoding: []byte{},
 	}
 
 	// initialize from state persisted before a crash

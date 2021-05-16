@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -28,13 +29,24 @@ type Op struct {
 	ClientID    clientIDT
 }
 
-// State required to keep track of
 type pendingCommit struct {
 	expectedIndex int
 	clientID      clientIDT
 	sequenceNum   int
 	// Send true if the applyMsg matches this, otherwise send false.
 	waitCh chan bool
+}
+
+type SnapshottableState struct {
+	// This is the core key-value store state.
+	kvs           map[string]string
+	lastProcessed int // 1-based command in the log which has been processed or/and applied.
+	// Highest sequence number from the client which has been applied.
+	// Note that since the client only makes one request at a time,
+	// the sequence numbers which are returned from the [applyCh] are
+	// non-decreasing. For that reason, we can just ignore sequence nums
+	// which are lower than sequence applied.
+	sequenceApplied map[clientIDT]int
 }
 
 // KVServer runs on top of a single raft instance. It processes
@@ -47,20 +59,68 @@ type KVServer struct {
 	dead         int32 // set by Kill()
 	maxraftstate int   // snapshot if log grows this big
 
-	// This is the core key-value store state.
-	kvs           map[string]string
-	lastProcessed int // 1-based command in the log which has been processed or/and applied.
-
 	// If a commit is in here, then we know that we've started agreement, but not
 	// yet processed a reply that SOMETHING got committed at the expected index.
-	pendingCommits map[int]*pendingCommit
+	pendingCommits     map[int]*pendingCommit
+	SnapshottableState *SnapshottableState
+}
 
-	// Highest sequence number from the client which has been applied.
-	// Note that since the client only makes one request at a time,
-	// the sequence numbers which are returned from the [applyCh] are
-	// non-decreasing. For that reason, we can just ignore sequence nums
-	// which are lower than sequence applied.
-	sequenceApplied map[clientIDT]int
+// func (rf *Raft) snapEncode() []byte {
+// 	w := new(bytes.Buffer)
+// 	e := labgob.NewEncoder(w)
+// 	e.Encode(rf.SnapShot)
+// 	return w.Bytes()
+// }
+
+// func (rf *Raft) snapDecode(data []byte) *SnapShot {
+// 	// will have to decode/encode the byte slice.
+// 	r := bytes.NewBuffer(data)
+// 	d := labgob.NewDecoder(r)
+// 	var SnapShot *SnapShot
+// 	d.Decode(&SnapShot)
+// 	return SnapShot
+// }
+
+func (kv *KVServer) encodeSnapshottable() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.SnapshottableState)
+	return w.Bytes()
+}
+
+// Assumes data is non-empty.
+func (kv *KVServer) decodeSnapshottable(data []byte) *SnapshottableState {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var SnapshottableState *SnapshottableState
+	err := d.Decode(&SnapshottableState)
+	if err != nil {
+		panic("can't decode snapshottable")
+	}
+	return SnapshottableState
+}
+
+// Invariant: acquire lock first.
+func (kv *KVServer) KVSnapshot() {
+	data := kv.encodeSnapshottable()
+	kv.rf.TakeSnapShot(data, kv.SnapshottableState.lastProcessed)
+}
+
+func (kv *KVServer) maybeLoadFromSnap() {
+	snapshot := kv.rf.LoadSnapshot()
+	if snapshot == nil {
+		return
+	}
+	kv.SnapshottableState = kv.decodeSnapshottable(snapshot.KVEncoding)
+}
+
+func (kv *KVServer) initSnapshottable() {
+	kv.SnapshottableState = &SnapshottableState{}
+	kv.SnapshottableState.kvs = make(map[string]string)
+	kv.SnapshottableState.lastProcessed = 0 // haven't processed any.
+	kv.SnapshottableState.sequenceApplied = make(map[clientIDT]int)
+
+	kv.maybeLoadFromSnap()
 }
 
 // StartKVServer is used to start a kvserver.
@@ -86,19 +146,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
-	kv.kvs = make(map[string]string)
-	kv.lastProcessed = 0 // haven't processed any.
-	snap := kv.rf.LoadSnapshot()
-	if snap != nil {
-		// We have to load from a checkpoint, before we process any incoming messages.
-		kv.kvs = snap.Kvs
-		kv.lastProcessed = snap.LogIndex + 1
-
-		// TODO: we also need to add other stuff to snapshot.
-	}
 	kv.pendingCommits = make(map[int]*pendingCommit)
-	kv.sequenceApplied = make(map[clientIDT]int)
+
+	kv.initSnapshottable()
 
 	go kv.readFromApplyCh()
 	return kv
@@ -109,6 +159,68 @@ func commitSame(pending *pendingCommit, op *Op) bool {
 	same := pending.clientID == op.ClientID
 	same = same && pending.sequenceNum == op.SequenceNum
 	return same
+}
+
+func (kv *KVServer) handleCommand(commitedMsg *raft.ApplyMsg) {
+	opCommitted := (commitedMsg.Command).(Op)
+	kv.mu.Lock()
+	if commitedMsg.CommandIndex != kv.SnapshottableState.lastProcessed+1 {
+		// if [CommandIndex] is less, then we've already processed this entry.
+		// if [CommandIndex] is greater, then at least one log entry was skipped.
+		// It could potentially happen if a snapshot is installed.
+		kv.mu.Unlock()
+		return
+	}
+
+	expectedCommit := kv.pendingCommits[commitedMsg.CommandIndex]
+	if kv.SnapshottableState.sequenceApplied[opCommitted.ClientID] < opCommitted.SequenceNum {
+		// Not in pending ack, and has never been removed from pending ack.
+		// We know that it hasn't been removed from pending ack, cause we remove
+		// from pending ack iff SequenceNum <= highest akced sequence num.
+		// So, we can be sure that this has never been applied to state machine.
+		if opCommitted.CommandOp == putCommand {
+			// Just put it.
+			kv.SnapshottableState.kvs[opCommitted.Key] = opCommitted.Value
+		} else if opCommitted.CommandOp == appendCommand {
+			value, ok := kv.SnapshottableState.kvs[opCommitted.Key]
+			if ok {
+				// Key already exists.
+				kv.SnapshottableState.kvs[opCommitted.Key] = value + opCommitted.Value
+			} else {
+				kv.SnapshottableState.kvs[opCommitted.Key] = opCommitted.Value
+			}
+		}
+		kv.SnapshottableState.sequenceApplied[opCommitted.ClientID] = opCommitted.SequenceNum
+	}
+
+	kv.SnapshottableState.lastProcessed = commitedMsg.CommandIndex
+
+	// TODO: Remove from expectedCommit.
+	if expectedCommit == nil {
+		// [expectedCommit] was nil. So, we weren't expecting this either
+		// due to a failure, or due to a different kvserver committing this.
+		// Either way, we can't send a response.
+		// Client may retry, but that request won't get double committed.
+		kv.mu.Unlock()
+	} else if commitSame(expectedCommit, &opCommitted) {
+		// This commit originated at this node, so send response back to
+		// [Clerk] that this is committed. No other node will send this response back.
+		// This could be a double send to the [Clerk]. But that's fine.
+		delete(kv.pendingCommits, commitedMsg.CommandIndex)
+		kv.mu.Unlock()
+		expectedCommit.waitCh <- true
+	} else {
+		// Commit doesn't match the expected commit, so some other node
+		// must have committed this.
+		// It's that nodes responsibility to reply to the client.
+		delete(kv.pendingCommits, commitedMsg.CommandIndex)
+		kv.mu.Unlock()
+		expectedCommit.waitCh <- false
+	}
+}
+
+func (kv *KVServer) handleRaftSentSnap(commitedMsg *raft.ApplyMsg) {
+
 }
 
 func (kv *KVServer) readFromApplyCh() {
@@ -122,58 +234,13 @@ func (kv *KVServer) readFromApplyCh() {
 		// This isn't a datarace since applyCh var is only ever
 		// read from.
 		commitedMsg := <-kv.applyCh
-		opCommitted := (commitedMsg.Command).(Op)
-		kv.mu.Lock()
-		expectedCommit := kv.pendingCommits[commitedMsg.CommandIndex]
-
-		dprintln(kv.me, opCommitted, commitedMsg.CommandIndex, expectedCommit)
-		dprintln("sequences", opCommitted.SequenceNum, kv.sequenceApplied[opCommitted.ClientID])
-
-		// Todo: We're currently not dropping entries from [pendingAck], and this could
-		// potentially baloon up in size.
-		// && opCommitted.SequenceNum > kv.sequenceSeen[opCommitted.ClientID]
-		if kv.sequenceApplied[opCommitted.ClientID] < opCommitted.SequenceNum {
-			dprintln("committing")
-			// Not in pending ack, and has never been removed from pending ack.
-			// We know that it hasn't been removed from pending ack, cause we remove
-			// from pending ack iff SequenceNum <= highest akced sequence num.
-			// So, we can be sure that this has never been applied to state machine.
-			if opCommitted.CommandOp == putCommand {
-				// Just put it.
-				kv.kvs[opCommitted.Key] = opCommitted.Value
-			} else if opCommitted.CommandOp == appendCommand {
-				value, ok := kv.kvs[opCommitted.Key]
-				if ok {
-					// Key already exists.
-					kv.kvs[opCommitted.Key] = value + opCommitted.Value
-				} else {
-					kv.kvs[opCommitted.Key] = opCommitted.Value
-				}
-			}
-			kv.sequenceApplied[opCommitted.ClientID] = opCommitted.SequenceNum
-		}
-
-		// TODO: Remove from expectedCommit.
-		if expectedCommit == nil {
-			// [expectedCommit] was nil. So, we weren't expecting this either
-			// due to a failure, or due to a different kvserver committing this.
-			// Either way, we can't send a response.
-			// Client may retry, but that request won't get double committed.
-			kv.mu.Unlock()
-		} else if commitSame(expectedCommit, &opCommitted) {
-			// This commit originated at this node, so send response back to
-			// [Clerk] that this is committed. No other node will send this response back.
-			// This could be a double send to the [Clerk]. But that's fine.
-			delete(kv.pendingCommits, commitedMsg.CommandIndex)
-			kv.mu.Unlock()
-			expectedCommit.waitCh <- true
+		if !commitedMsg.CommandValid {
+			// We've received a snapshot from raft.
+			// We can ask raft if we should upload this.
+			panic("shouldn't be sent.")
+			kv.handleRaftSentSnap(&commitedMsg)
 		} else {
-			// Commit doesn't match the expected commit, so some other node
-			// must have committed this.
-			// It's that nodes responsibility to reply to the client.
-			delete(kv.pendingCommits, commitedMsg.CommandIndex)
-			kv.mu.Unlock()
-			expectedCommit.waitCh <- false
+			kv.handleCommand(&commitedMsg)
 		}
 	}
 }
@@ -229,15 +296,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.pendingCommits[expIndex] = pendingCommit
 	kv.mu.Unlock()
 
-	dprintln("pending1", kv.me, pendingCommit)
 	worked := <-pendingCommit.waitCh
-	dprintln("pending2", kv.me, pendingCommit)
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if worked {
 		// The op worked, so we can do a read.
-		value, ok := kv.kvs[args.Key]
+		value, ok := kv.SnapshottableState.kvs[args.Key]
 		if ok {
 			reply.Err = OK
 			reply.Value = value
@@ -313,9 +378,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 	kv.pendingCommits[expIndex] = pendingCommit
 	kv.mu.Unlock()
-	dprintln("pending1", kv.me, kv.rf.Me(), pendingCommit)
 	worked := <-pendingCommit.waitCh
-	dprintln("pending2", kv.me, kv.rf.Me(), pendingCommit)
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	if worked {

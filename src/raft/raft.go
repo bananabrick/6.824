@@ -19,7 +19,7 @@ package raft
 
 import (
 	"bytes"
-	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -28,6 +28,15 @@ import (
 	"../labgob"
 	"../labrpc"
 )
+
+const debug = 0
+
+func dprintln(a ...interface{}) (n int, err error) {
+	if debug > 0 {
+		log.Println(a...)
+	}
+	return
+}
 
 // It doesn't look like they have this in stdlib.
 // go is trash.
@@ -59,7 +68,6 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-	Logs         [](*RLog)
 }
 
 const (
@@ -189,15 +197,14 @@ func (rf *Raft) Leader() bool {
 
 // Invariant: The slice and the kvs passed should have no other references
 // which can be modified.
-func (rf *Raft) sendSnapshot(snap *SnapShot, logs [](*RLog)) {
+func (rf *Raft) sendSnapshot(snap *SnapShot) {
 	// Sends the latest snapshot up through append entries.
 	rf.applyCh <- ApplyMsg{
 		false,
 		snap,
 		-1,
-		logs,
 	}
-	fmt.Println("snapshot sent to kvserver", rf.me)
+	dprintln("snapshot sent to kvserver", rf.me)
 }
 
 // Returns [true] if the kvserver should equip the log.
@@ -206,29 +213,36 @@ func (rf *Raft) sendSnapshot(snap *SnapShot, logs [](*RLog)) {
 func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Println("raft maybe install snapshot", rf.me, msg)
+	dprintln("raft maybe install snapshot", rf.me, msg)
 	snap := msg.Command.(*SnapShot)
 
 	if snap.LogIndex <= rf.SnapShot.LogIndex {
 		// We've already installed this snapshot.
 		defer func() {
-			fmt.Println("raft snapshot installation terminated", rf.me, msg, snap.LogIndex, rf.SnapShot.LogIndex)
+			dprintln("raft snapshot installation terminated", rf.me, msg, snap.LogIndex, rf.SnapShot.LogIndex)
 		}()
 		return false
 	}
+
+	if rf.lastLogIndex() <= snap.LogIndex {
+		rf.PersistentState.RaftLog = [](*RLog){}
+	} else {
+		// So, we have entries beyond the snapshot.
+		rf.PersistentState.RaftLog = rf.sliceLog(snap.LogIndex+1, rf.lastLogIndex()+1)
+	}
+
 	rf.SnapShot = &SnapShot{
 		snap.LogTerm,
 		snap.LogIndex,
 		snap.KVEncoding,
 	}
-	rf.PersistentState.RaftLog = msg.Logs
 	rf.lastApplied = snap.LogIndex
 	rf.commitIndex = snap.LogIndex
 	rf.persistWithSnap()
 
 	defer func() {
 		// Allow some other thread to reply success to the leader.
-		fmt.Println("raft snapshot installation successful", rf.me, msg)
+		dprintln("raft snapshot installation successful", rf.me, msg)
 	}()
 
 	return true
@@ -239,13 +253,10 @@ func (rf *Raft) MaybeInstallSnapshot(msg ApplyMsg) bool {
 // Invariant: Acquire lock first.
 // [appliedIndex] is 1-based.
 func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
-	fmt.Println("raft begin taking snapshot", rf.Me())
+	dprintln("raft begin taking snapshot", rf.Me())
 	defer func() {
-		fmt.Println("raft end taking snapshot", rf.Me())
+		dprintln("raft end taking snapshot", rf.Me())
 	}()
-	if appliedIndex == 0 {
-		return
-	}
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -257,8 +268,6 @@ func (rf *Raft) TakeSnapShot(kvEncoding []byte, appliedIndex int) {
 	// we can just return. Although, that should never happen.
 	// SnapShots must always proceed forward in time.
 	if rf.SnapShot.LogIndex >= appliedIndex {
-		// fmt.Println(rf.SnapShot.LogIndex, appliedIndex)
-		// panic("New Snapshot position is not increasing.")
 		return
 	}
 
@@ -441,8 +450,6 @@ func (rf *Raft) startElection() {
 				// Majority voted us in. I don't think we need to
 				// care about other votes for this election.
 				justReturn = true
-
-				// fmt.Println("have become leader", rf.me)
 			}
 		}
 		rf.mu.Unlock()
@@ -469,6 +476,7 @@ func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesRepl
 	prevLogIndex := rf.nextIndex[i] - 1
 	var prevLogTerm int
 	var req *AppendEntriesArgs
+	var entries [](*RLog)
 	rep := &AppendEntriesReply{}
 	if prevLogIndex < rf.SnapShot.LogIndex {
 		prevLogTerm = rf.SnapShot.LogTerm
@@ -478,15 +486,10 @@ func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesRepl
 			LogIndex:   prevLogIndex,
 			KVEncoding: rf.SnapShot.KVEncoding,
 		}
-		var entries [](*RLog)
-		log := make([]*RLog, len(rf.PersistentState.RaftLog))
-		copy(log, rf.PersistentState.RaftLog)
-		entries = log
 		req = &AppendEntriesArgs{
 			rf.PersistentState.CurrentTerm, rf.me, prevLogIndex, prevLogTerm, entries, rf.commitIndex, snap}
 	} else {
 		prevLogTerm = rf.aLogTerm(prevLogIndex)
-		var entries [](*RLog)
 		if rf.lastLogIndex() >= rf.nextIndex[i] {
 			log := make([]*RLog, rf.lastLogIndex()+1-rf.nextIndex[i])
 			copy(log, rf.sliceLog(rf.nextIndex[i], rf.lastLogIndex()+1))
@@ -620,7 +623,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.LeaderTerm > rf.PersistentState.CurrentTerm {
 			rf.state = follower
 		} else if args.LeaderTerm == rf.PersistentState.CurrentTerm {
-			fmt.Println("huh", args, rf)
+			dprintln("another leader who get elected in the same term", args, rf)
 			panic("Another node send ae to leader with same term.")
 		}
 	}
@@ -629,13 +632,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// At this point, we accept a valid leader, so we need
 	// to reset the timer.
 	if args.SnapShot != nil {
-		fmt.Println("received a snapshot", rf.me)
-		go rf.sendSnapshot(args.SnapShot, args.Entries)
-		// At this point we either took over the snapshot or not.
-		// We're deadlocking by waiting here.
-		// reply.Success = <-installCh
-		// fmt.Println("snapshot install reply", rf.me, installCh, reply.Success)
-		reply.Success = true
+		dprintln("received a snapshot", rf.me)
+		// Just say yes, if snapshot is already installed.
+		if rf.SnapShot.LogIndex >= args.SnapShot.LogIndex {
+			dprintln("snapshot received already installed", rf.me)
+			reply.Success = true
+		} else {
+			dprintln("begin snapshot installation", rf.me)
+			go rf.sendSnapshot(args.SnapShot)
+			reply.Success = false
+		}
+
 	} else {
 		reply.Success = rf.updateAfterHearbeat(args)
 	}
@@ -780,7 +787,6 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 				true,
 				rf.indexLog(rf.lastApplied).Command,
 				rf.lastApplied + 1,
-				nil,
 			}
 
 			// Again, we need to expose index + 1 for the tests

@@ -2,7 +2,6 @@ package kvraft
 
 import (
 	"crypto/rand"
-	"fmt"
 	"math/big"
 	"time"
 
@@ -80,7 +79,7 @@ func (ck *Clerk) Get(key string) string {
 	for {
 		dprintln("client sending get to", ck.currLeader, ck.clientID, nextSeqNum)
 		ok, rep := ck.makeRPCWithTimeoutGet(ck.currLeader, "KVServer.Get", args, reply, 200)
-		fmt.Println("client_g", ok, args, rep, ck.currLeader)
+		dprintln("client_g", ok, args, rep, ck.currLeader)
 		if ok {
 			// Request went through.
 			if rep.Err == OK {
@@ -141,7 +140,7 @@ func (ck *Clerk) PutAppend(key string, value string, op clientOp) {
 	for {
 		dprintln("client sending update to", ck.currLeader, ck.clientID, nextSeqNum)
 		ok, rep := ck.makeRPCWithTimeoutPut(ck.currLeader, "KVServer.PutAppend", args, reply, 200)
-		fmt.Println("client_p", ok, args, rep, ck.currLeader)
+		dprintln("client_p", ok, args, rep, ck.currLeader)
 		if ok && rep.Err == OK {
 			// Request went through.
 			ck.seenResponse = max(ck.seenResponse, args.SequenceNum)

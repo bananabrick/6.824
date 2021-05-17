@@ -146,10 +146,12 @@ func (kv *KVServer) takeSnaps() {
 
 		time.Sleep(time.Second * 2)
 		kv.mu.Lock()
-		fmt.Println("periodic server state", "kvme", kv.me, kv.SnapshottableState.LastProcessed)
-		fmt.Println("taking snapshot", "kvme", kv.me, kv.rf.Leader())
+		// Just using this as an opportunity to write debug logs for how far the server
+		// has gotten.
+		dprintln("periodic server state", "kvme", kv.me, kv.SnapshottableState.LastProcessed)
+		dprintln("taking snapshot", "kvme", kv.me, kv.rf.Leader())
 		kv.rf.TakeSnapShot(kv.encodeSnapshottable(), kv.SnapshottableState.LastProcessed)
-		fmt.Println("took snapshot", "kvme", kv.me, kv.rf.Leader())
+		dprintln("took snapshot", "kvme", kv.me, kv.rf.Leader())
 		kv.mu.Unlock()
 	}
 }
@@ -164,7 +166,7 @@ func commitSame(pending *pendingCommit, op *Op) bool {
 func (kv *KVServer) handleCommand(commitedMsg *raft.ApplyMsg) {
 	opCommitted := (commitedMsg.Command).(Op)
 	kv.mu.Lock()
-	fmt.Println("kvserver received command", "kvme", kv.me, kv.rf.Leader(), commitedMsg.CommandIndex)
+	dprintln("kvserver received command", "kvme", kv.me, kv.rf.Leader(), commitedMsg.CommandIndex)
 	if commitedMsg.CommandIndex != kv.SnapshottableState.LastProcessed+1 {
 		// if [CommandIndex] is less, then we've already processed this entry.
 		// if [CommandIndex] is greater, then at least one log entry was skipped.
@@ -172,9 +174,8 @@ func (kv *KVServer) handleCommand(commitedMsg *raft.ApplyMsg) {
 		kv.mu.Unlock()
 		return
 	}
-	fmt.Println("kvserver processing command", "kvme", kv.me, kv.rf.Leader(), commitedMsg.CommandIndex)
+	dprintln("kvserver processing command", "kvme", kv.me, kv.rf.Leader(), commitedMsg.CommandIndex)
 	expectedCommit := kv.PendingCommits[commitedMsg.CommandIndex]
-	// fmt.Println("stuff", commitedMsg.CommandIndex, kv.SnapshottableState.LastProcessed+1, expectedCommit)
 	if kv.SnapshottableState.SequenceApplied[opCommitted.ClientID] < opCommitted.SequenceNum {
 		// Not in pending ack, and has never been removed from pending ack.
 		// We know that it hasn't been removed from pending ack, cause we remove
@@ -225,11 +226,11 @@ func (kv *KVServer) handleCommand(commitedMsg *raft.ApplyMsg) {
 func (kv *KVServer) handleRaftSentSnap(commitedMsg *raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	fmt.Println("kvserver received snap", "kvme", kv.me, kv.rf.Leader())
 	snapshot := (commitedMsg.Command).(*raft.SnapShot)
 	snapshottable := kv.decodeSnapshottable(snapshot.KVEncoding)
+	dprintln("kvserver received snap", "kvme", kv.me, kv.rf.Leader(), snapshot)
 	if kv.rf.MaybeInstallSnapshot(*commitedMsg) {
-		fmt.Println("kv server acquiring snap", "kvme", kv.me, kv.rf.Leader())
+		dprintln("kv server acquiring snap", "kvme", kv.me, kv.rf.Leader())
 		kv.SnapshottableState = snapshottable
 	}
 }
@@ -245,9 +246,9 @@ func (kv *KVServer) readFromApplyCh() {
 		// This isn't a datarace since applyCh var is only ever
 		// read from.
 		commitedMsg := <-kv.applyCh
-		fmt.Println("kvserver received from applych", commitedMsg, "kvme", kv.me, kv.rf.Leader())
+		dprintln("kvserver received from applych", commitedMsg, "kvme", kv.me, kv.rf.Leader())
 		kv.mu.Lock()
-		fmt.Println("kvserver received from applych acquire lock", commitedMsg, "kvme", kv.me, kv.rf.Leader())
+		dprintln("kvserver received from applych acquire lock", commitedMsg, "kvme", kv.me, kv.rf.Leader())
 		kv.mu.Unlock()
 		if !commitedMsg.CommandValid {
 			// We've received a snapshot from raft.
@@ -309,14 +310,14 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	kv.PendingCommits[expIndex] = pendingCommit
-	fmt.Println("get", pendingCommit, newOp, "kvme", kv.me, "leader", kv.rf.Leader())
+	dprintln("get", pendingCommit, newOp, "kvme", kv.me, "leader", kv.rf.Leader())
 	kv.mu.Unlock()
 
 	worked := <-pendingCommit.WaitCh
 
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	fmt.Println("get1", pendingCommit, worked, kv.SnapshottableState.Kvs[args.Key], "leader", kv.rf.Leader())
+	dprintln("get1", pendingCommit, worked, kv.SnapshottableState.Kvs[args.Key], "leader", kv.rf.Leader())
 	if worked {
 		// The op worked, so we can do a read.
 		value, ok := kv.SnapshottableState.Kvs[args.Key]
@@ -394,13 +395,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	kv.PendingCommits[expIndex] = pendingCommit
-	fmt.Println("put", pendingCommit, newOp, "kvme", kv.me, "leader", kv.rf.Leader())
+	dprintln("put", pendingCommit, newOp, "kvme", kv.me, "leader", kv.rf.Leader())
 	kv.mu.Unlock()
 
 	worked := <-pendingCommit.WaitCh
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	fmt.Println("put1", pendingCommit, worked, newOp, "leader", kv.rf.Leader())
+	dprintln("put1", pendingCommit, worked, newOp, "leader", kv.rf.Leader())
 	if worked {
 		reply.Err = OK
 	} else {

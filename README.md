@@ -7,4 +7,4 @@ Lab 1, 2a, 2b, 2c, 3a done
 
 Adding snapshotting was a struggle and this image makes me cry:
 
-![image](success)
+![success](success.png)

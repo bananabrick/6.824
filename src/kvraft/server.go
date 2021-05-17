@@ -134,24 +134,27 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.initSnapshottable()
 
 	go kv.readFromApplyCh()
-	go kv.takeSnaps()
+	go kv.takeSnaps(persister)
 	return kv
 }
 
-func (kv *KVServer) takeSnaps() {
+func (kv *KVServer) takeSnaps(persister *raft.Persister) {
 	for {
 		if kv.killed() {
 			return
 		}
 
-		time.Sleep(time.Second * 2)
+		time.Sleep(time.Millisecond * 30)
 		kv.mu.Lock()
 		// Just using this as an opportunity to write debug logs for how far the server
 		// has gotten.
-		dprintln("periodic server state", "kvme", kv.me, kv.SnapshottableState.LastProcessed)
-		dprintln("taking snapshot", "kvme", kv.me, kv.rf.Leader())
-		kv.rf.TakeSnapShot(kv.encodeSnapshottable(), kv.SnapshottableState.LastProcessed)
-		dprintln("took snapshot", "kvme", kv.me, kv.rf.Leader())
+		dprintln("determining whether to take snap", "kvme", kv.me, kv.SnapshottableState.LastProcessed)
+		if persister.RaftStateSize() >= kv.maxraftstate {
+			dprintln("taking snapshot", "kvme", kv.me, kv.rf.Leader(), persister.RaftStateSize())
+			kv.rf.TakeSnapShot(kv.encodeSnapshottable(), kv.SnapshottableState.LastProcessed)
+			dprintln("took snapshot", "kvme", kv.me, kv.rf.Leader(), persister.RaftStateSize())
+		}
+
 		kv.mu.Unlock()
 	}
 }
@@ -240,8 +243,6 @@ func (kv *KVServer) readFromApplyCh() {
 		if kv.killed() {
 			return
 		}
-
-		// TODO: try to install snapshots, and ignore commands <= lastApplied to the kvserver.
 
 		// This isn't a datarace since applyCh var is only ever
 		// read from.
@@ -390,7 +391,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// There must be a goroutine waiting to read this, cause otherwise
 		// we already wrote to this channel. But if we write to the channel
 		// we also remove the entry from the map.
-		// TODO: make sure writing on this channel removes it from the map.
 		prevOp.WaitCh <- false
 	}
 

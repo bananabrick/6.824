@@ -135,8 +135,8 @@ type Raft struct {
 	// This state is only valid for leaders once they
 	// win an election and is only init after they win.
 	// Invariant: [nextIndex] must always be greater than match index.
-	// TODO: [matchIndex], [nextIndex] can be out of range. So, we need to make sure that
-	// using them to access the log, doesn't result in an error.
+	// Note that both [nextIndex] and [matchIndex] can be out of range of the
+	// truncated log.
 	nextIndex  map[int]int // Index of the next log entry to send to a server.
 	matchIndex map[int]int // Index of the highest log entry known to be replicated on a server.
 }
@@ -329,8 +329,6 @@ func (rf *Raft) lastLogIndex() int {
 	return rf.baseIndex() + len(rf.PersistentState.RaftLog) - 1
 }
 
-// TODO: for the following two functions, we need to
-// consider the cases where we might get -1.
 // Invariant: Acquire lock before calling this.
 func (rf *Raft) aLogTerm(n int) int {
 	base := rf.baseIndex()
@@ -501,7 +499,6 @@ func (rf *Raft) appendEntryStruct(i int) (*AppendEntriesArgs, *AppendEntriesRepl
 	return req, rep
 }
 
-// TODO: fix this
 func (rf *Raft) sendHearts() {
 	rf.mu.Lock()
 	if rf.state != leader {
@@ -757,7 +754,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// We kinda just let this be taken to the other nodes
 	// along with a heartbeat. We don't want to do extra shit!
-	// TODO: Might need to send heatbeats from here for speedup.
 	newLog := &RLog{command, rf.PersistentState.CurrentTerm}
 	rf.PersistentState.RaftLog = append(rf.PersistentState.RaftLog, newLog)
 	rf.persist()
@@ -775,7 +771,6 @@ func (rf *Raft) periodicallyApply(ch chan ApplyMsg) {
 		if rf.killed() {
 			return
 		}
-		// TODO: Check if the sleep constant needs to be tuned.
 		time.Sleep(time.Millisecond * time.Duration(30))
 
 		rf.mu.Lock()
@@ -804,7 +799,6 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 		if rf.killed() {
 			return
 		}
-		// TODO: Check if the sleep constant needs to be tuned.
 		time.Sleep(time.Millisecond * time.Duration(30))
 		rf.mu.Lock()
 		if rf.state == leader {
@@ -831,7 +825,6 @@ func (rf *Raft) periodicallyUpdateCommitIndex() {
 				}
 			}
 
-			// TODO: Make sure that matchIndex is also upto date for the leader.
 			// Iterate from the back to get the first valid log index
 			// which is the largest.
 			for i := len(indices) - 1; i >= 0; i-- {
@@ -973,8 +966,8 @@ func initPersistent(rf *Raft) {
 	// initialize from state persisted before a crash
 	rf.setPersistent(rf.persister.ReadRaftState())
 
-	// TODO: We're loading the snapshot here, but we need to make sure
-	// that the kvserver has already installed the snapshot, before processing
+	// We're loading the snapshot here, but we need to make sure
+	// that the kvserver has already installed the snapshot, before it processes
 	// any commands.
 	rf.setSnap(rf.persister.ReadSnapshot())
 
